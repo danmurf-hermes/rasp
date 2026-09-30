@@ -196,7 +196,7 @@ Any status change should be accompanied by a short note in the relevant section 
 |---|---|---|
 | Project scaffolding | Built | Cargo workspace, five focused crates, placeholder `rasp` CLI (`version` works), README quick start. |
 | Cargo workspace and CI | Built | GitHub Actions quality job (fmt, clippy, test on Ubuntu and macOS) plus a Docker build/run smoke test. Pre-commit hook in `.githooks/` (enable via `git config core.hooksPath .githooks`) runs the same gates before every commit. `AGENTS.md` records the conventions for future agents. |
-| ASP page parser | Built | Text, `<% %>`, `<%= %>`, `<%@ Language %>`, and `<!-- #include -->` directives parsed per page; ordinary comments pass through. |
+| ASP page parser | Built | Text, `<% %>`, `<%= %>`, `<%@ Language %>`, `<!-- #include -->` directives, and `<SCRIPT RUNAT=Server LANGUAGE=VBScript>` blocks parsed per page; ordinary comments and client-side `<script>` elements pass through. |
 | Include resolution | Built | `file` resolves against the containing page's directory, `virtual` against the app root; path-confinement checks, 32-depth cycle detection. |
 | VBScript lexer | Built | Case-insensitive keywords, strings with `""` escapes, `'` comments, `_` continuations, hex/octal literals, statement line-end tracking. |
 | VBScript parser and AST | Built | Expressions with full precedence, Dim (with array sizes), Const, assignment (incl. indexed stores), If/ElseIf/Else (block and single-line), Sub/Function declarations, Call, deferred loop openers/closers and procedure delimiters for cross-block bodies. |
@@ -204,9 +204,9 @@ Any status change should be accompanied by a short note in the relevant section 
 | Variant/value semantics | Partial | `Empty`/`Null`/`Bool`/`Int`/`Float`/`Str`/`Date`/`Array` with documented coercion rules (strings parse as dates before numbers); multi-dimensional arrays and `Byte`/binary data still to come. |
 | ASP intrinsic objects | In progress | `Response.Write/End/Clear` and the buffer passthrough work; `Request.QueryString` reads query/form/cookie data; Response controls (Redirect, ContentType, cookies) parse but their effects land in M3. |
 | Request lifecycle | In progress | Output buffers per request and ends early on `Response.End`; errors produce diagnostic pages/500s; timeouts and size limits still to come. |
-| Session state | Not started | Begin with signed cookie + in-process store; add Redis later if needed. |
-| Application state | Not started | Begin with per-process state. |
-| `global.asa` support | Not started | Start with application/session events; defer COM/library registration. |
+| Session state | Built | `Session` named values + `Contents`, `SessionID`, `Timeout`, `Abandon`; `ASPSESSIONID` cookie maps to an in-process store with idle expiry (Timeout minutes, default 20). Signed cookie values and pluggable remote stores deferred. |
+| Application state | Built | `Application` named values + `Contents`, `Lock`/`UnLock`; per-process state. Lock is a flag until concurrent request handling exists. |
+| `global.asa` support | Built | `Application_OnStart` (once per process) and `Session_OnStart` (per new session) fire before the page; `Session_OnEnd`/`Application_OnEnd` are parsed but not fired (in-process sessions end with the process). |
 | Filesystem object mapping | Not started | Map `Scripting.FileSystemObject` to a sandboxed Rust implementation. |
 | Database/ADO support | Not started | Start with a small SQL adapter before trying broad ADO compatibility. |
 | JScript support | Not started | Optional; prioritize VBScript first. |
@@ -290,7 +290,11 @@ Acceptance criteria:
 
 Current state:
 
-- All "Initial support" items are implemented and tested except `<SCRIPT RUNAT=SERVER>` recognition.
+- All "Initial support" items are implemented and tested, including
+  `<SCRIPT RUNAT=Server LANGUAGE=VBScript>` (M4): server elements are
+  preprocessed like `<% %>` blocks, client-side `<script>` stays page
+  text, and `<script>` inside an HTML comment is not mistaken for a
+  server element.
 - Includes resolve with path confinement and depth-capped cycle detection.
 - Script is executed via a flattened statement stream so `For`/`Do` bodies can interleave literal markup across `<% %>` blocks (matching Classic ASP behavior); block `If` bodies must still live inside one `<% %>` block for now.
 
@@ -503,9 +507,16 @@ Initial support:
 - Named values.
 - `Contents`.
 
+Built (M4): named values and `Contents` round-trip through the
+`ASPSESSIONID` cookie's in-process store, idle expiry uses each
+session's own `Timeout` (default 20 minutes), `SessionID` renders as
+hex, `Abandon` drops the session at request end. Deferred: signed
+cookie values (ids are store-issued but not HMAC'd), `StaticObjects`,
+and pluggable remote stores.
+
 Storage phases:
 
-1. In-memory per process for local use and development.
+1. In-memory per process for local use and development. **Built (M4).**
 2. Pluggable distributed storage for multi-instance containers.
 
 #### `Application`
@@ -516,6 +527,10 @@ Initial support:
 - `Lock` and `UnLock`.
 - `Contents`.
 - Per-process state.
+
+Built (M4): named values and `Contents` are per-process; `Lock`/
+`UnLock` set the state's flag (real exclusion requires concurrent
+request handling).
 
 #### `ObjectContext`
 
@@ -881,18 +896,25 @@ Definition of done:
 
 ### Milestone 4 — Includes, sessions, and application state
 
-**Status:** Not started
+**Status:** Built
 
 Deliverables:
 
-- File and virtual includes.
-- Session cookie and in-process store.
-- `Application` and `Session` objects.
-- Basic `global.asa` event handling.
+- File and virtual includes. *(Built in Milestones 1–2.)*
+- Session cookie and in-process store. **Built** — `ASPSESSIONID`
+  cookie, in-process store, idle expiry per session `Timeout`.
+- `Application` and `Session` objects. **Built** — named values,
+  `Contents`, `SessionID`/`Timeout`/`Abandon`, `Lock`/`UnLock` (flag).
+- Basic `global.asa` event handling. **Built** — `Application_OnStart`
+  and `Session_OnStart` fire (once per process / per new session);
+  `*OnEnd` handlers are parsed but not fired yet.
 
 Definition of done:
 
-- A small multi-page stateful application runs.
+- A small multi-page stateful application runs. **Met** — the
+  `examples/hello-app/state.asp` counter page runs over two sessions
+  with per-session and shared counters (golden-tested), plus a
+  `<SCRIPT RUNAT=Server>` include demo page.
 
 ### Milestone 5 — Filesystem and object mappings
 
@@ -1012,6 +1034,10 @@ This checklist applies before every pull request is marked ready for review.
 
 ## 12. Immediate next steps
 
-1. Milestone 4 — includes, sessions, and application state: Session cookie + in-process store, `Session`/`Application` objects, basic `global.asa` events (`Session_OnStart`/`Application_OnStart`).
+1. Milestone 5 — filesystem and object mappings: native object
+   interface (`Server.CreateObject` with a ProgID registry,
+   `Scripting.FileSystemObject` sandboxed per §7.8, then
+   `Scripting.Dictionary`), plus `Server.MapPath`/`Execute`/`Transfer`.
 2. Finish the variant-semantics workstream: multi-dimensional arrays, `Byte`/binary data (`Request.BinaryRead`/`Response.BinaryWrite`), and a documented coercion table.
-3. Keep `AGENTS.md` in step with new conventions as they emerge (note: the M2 executor's normalization pass over deferred delimiters is the load-bearing architecture for cross-block and nested constructs).
+3. Session hardening follow-ups (small, do with M5 or as a standalone PR): signed session cookie values (HMAC with a per-process key), concurrent request handling so `Application.Lock` becomes real exclusion, and firing `Session_OnEnd`/`Application_OnEnd` from the expiry/abort paths.
+4. Keep `AGENTS.md` in step with new conventions as they emerge (note: the M2 executor's normalization pass over deferred delimiters is the load-bearing architecture for cross-block and nested constructs).

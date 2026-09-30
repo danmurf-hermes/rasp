@@ -5,7 +5,10 @@ pub mod lexer;
 pub mod parser;
 pub mod vb_datetime;
 
-pub use eval::{Cookie, ExecEnv, ResponseBuffer, exec_block, exec_block_loops};
+pub use eval::{
+    ApplicationState, Cookie, DEFAULT_SESSION_TIMEOUT_MIN, ExecEnv, ResponseBuffer, SessionStore,
+    StateStores, exec_block, exec_block_loops,
+};
 pub use lexer::Tok;
 pub use parser::{Expr, Stmt, Variant, parse_block};
 
@@ -222,7 +225,107 @@ End If";
         let mut env = ExecEnv::new();
         exec_block(&stmts, &mut env).unwrap();
         assert_eq!(env.response.body(), "dan");
-        assert_eq!(env.session.get("user"), Some(&Variant::Str("dan".into())));
+        assert_eq!(
+            env.session.values.get("user"),
+            Some(&Variant::Str("dan".into()))
+        );
+    }
+
+    #[test]
+    fn session_contents_round_trip() {
+        let out = render(
+            "Session.Contents(\"page\") = \"home\"\nResponse.Write Session.Contents(\"page\")",
+        );
+        assert_eq!(out, "home");
+    }
+
+    #[test]
+    fn application_round_trip() {
+        let src = "Application(\"hits\") = 41\nApplication(\"hits\") = Application(\"hits\") + 1\nResponse.Write Application(\"hits\")";
+        let stmts = parse_block(src, 1).unwrap();
+        let mut env = ExecEnv::new();
+        exec_block(&stmts, &mut env).unwrap();
+        assert_eq!(env.response.body(), "42");
+        assert_eq!(env.application.values.get("hits"), Some(&Variant::Int(42)));
+    }
+
+    #[test]
+    fn session_id_renders_hex() {
+        let src = "Response.Write Session.SessionID";
+        let stmts = parse_block(src, 1).unwrap();
+        let mut env = ExecEnv::new();
+        env.session.id = 0x0a0b0c;
+        exec_block(&stmts, &mut env).unwrap();
+        assert_eq!(env.response.body(), "a0b0c");
+    }
+
+    #[test]
+    fn session_timeout_round_trip() {
+        let src = "Session.Timeout = 45\nResponse.Write \"ok\"";
+        let stmts = parse_block(src, 1).unwrap();
+        let mut env = ExecEnv::new();
+        exec_block(&stmts, &mut env).unwrap();
+        assert_eq!(env.response.body(), "ok");
+        assert_eq!(env.session.timeout_min, 45);
+    }
+
+    #[test]
+    fn session_timeout_minimum_is_enforced() {
+        let err = render_err("Session.Timeout = 0");
+        assert!(matches!(err, AspError::Runtime(d) if d.message.contains("at least 1")));
+    }
+
+    #[test]
+    fn session_abandon_flags_the_store() {
+        let src = "Session(\"keep\") = \"no\"\nSession.Abandon";
+        let stmts = parse_block(src, 1).unwrap();
+        let mut env = ExecEnv::new();
+        exec_block(&stmts, &mut env).unwrap();
+        assert!(env.session.abandoned);
+    }
+
+    #[test]
+    fn application_lock_unlock_flags() {
+        let src = "Application.Lock\nApplication(\"safe\") = True\nApplication.UnLock";
+        let stmts = parse_block(src, 1).unwrap();
+        let mut env = ExecEnv::new();
+        exec_block(&stmts, &mut env).unwrap();
+        assert!(!env.application.locked);
+        assert_eq!(
+            env.application.values.get("safe"),
+            Some(&Variant::Bool(true))
+        );
+    }
+
+    #[test]
+    fn session_member_unknown_is_clear() {
+        let err = parse_block("Session.Count", 1).unwrap_err();
+        assert!(
+            matches!(err, AspError::Syntax(d) if d.message.contains("not supported in Milestone 4"))
+        );
+        let err = parse_block("Application.StaticObjects(1)", 1).unwrap_err();
+        assert!(matches!(err, AspError::Syntax(d) if d.message.contains("StaticObjects")));
+        let err = parse_block("Session.Timeout = 1\nx = Session.Timeout", 1).unwrap_err();
+        assert!(
+            matches!(err, AspError::Syntax(d) if d.message.to_ascii_lowercase().contains("session.timeout"))
+        );
+    }
+
+    #[test]
+    fn state_stores_flow_through_the_env() {
+        let src = "Response.Write Session(\"who\") & \"/\" & Application(\"app\")";
+        let stmts = parse_block(src, 1).unwrap();
+        let mut env = ExecEnv::new().with_state(StateStores {
+            session: SessionStore::new(7),
+            application: ApplicationState {
+                values: HashMap::from([("app".to_string(), Variant::Str("v".into()))]),
+                locked: false,
+                started: false,
+            },
+        });
+        exec_block(&stmts, &mut env).unwrap();
+        assert_eq!(env.response.body(), "/v"); // Session 7 has no "who" yet
+        assert_eq!(env.session.id, 7);
     }
 
     #[test]

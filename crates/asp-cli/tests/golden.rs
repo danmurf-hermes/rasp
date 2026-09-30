@@ -168,3 +168,87 @@ fn golden_querystring_page() {
     assert_eq!(response.body, "Hello Dan");
     let _ = HashMap::<String, String>::new();
 }
+
+/// A stateful GET through a fresh server holder (M4 goldens run the
+/// real cross-request state path).
+fn stateful_get(
+    holder: &asp_http::ServerHolder,
+    path: &str,
+    cookie: Option<&str>,
+) -> asp_http::HttpResponse {
+    let config = ServerConfig::default();
+    let root_relative = resolve_request_path(&app(), &config, path);
+    let request = HttpRequest {
+        method: "GET".to_string(),
+        path: path.to_string(),
+        query: String::new(),
+        form: String::new(),
+        cookies: cookie
+            .map(|c| format!("ASPSESSIONID={c}"))
+            .unwrap_or_default(),
+        headers: Vec::new(),
+    };
+    asp_http::handle_request_with_state(holder, &app(), &root_relative, &request, true).0
+}
+
+fn session_cookie(response: &asp_http::HttpResponse) -> String {
+    response
+        .set_cookies
+        .iter()
+        .find(|c| c.to_ascii_lowercase().starts_with("aspsessionid"))
+        .map(|c| c.split_once('=').unwrap().1.to_string())
+        .expect("new visit must set the session cookie")
+}
+
+#[test]
+fn golden_serverscript_include_page() {
+    assert_eq!(
+        stateful_get(
+            &asp_http::ServerHolder::for_app_root(&app()).unwrap(),
+            "/serverscript.asp",
+            None
+        )
+        .body,
+        "\n\nSHOUT IT OUT"
+    );
+}
+
+#[test]
+fn golden_state_page_session_round_trip() {
+    let holder = asp_http::ServerHolder::for_app_root(&app()).unwrap();
+    let first = stateful_get(&holder, "/state.asp", None);
+    let cookie = session_cookie(&first);
+    assert_eq!(
+        first.body,
+        "\n\n<p>Your views: 1</p>\n<p>All views: 1</p>\n<p>Your session id: 1</p>\n<p>App booted: yes</p>"
+    );
+    let second = stateful_get(&holder, "/state.asp", Some(&cookie));
+    assert_eq!(
+        second.body,
+        "\n\n<p>Your views: 2</p>\n<p>All views: 2</p>\n<p>Your session id: 1</p>\n<p>App booted: yes</p>"
+    );
+    // An established session sends no new cookie.
+    assert!(session_cookie_or_none(&second).is_none());
+}
+
+fn session_cookie_or_none(response: &asp_http::HttpResponse) -> Option<String> {
+    response
+        .set_cookies
+        .iter()
+        .find(|c| c.to_ascii_lowercase().starts_with("aspsessionid"))
+        .map(|c| c.split_once('=').unwrap().1.to_string())
+}
+
+#[test]
+fn golden_global_asa_app_values_are_shared() {
+    // state.asp's global.asa Application_OnStart ran in the previous
+    // test with its own holder; here a separate holder proves events
+    // fire per-process and the app counter carries across sessions.
+    let holder = asp_http::ServerHolder::for_app_root(&app()).unwrap();
+    let cookie_a = session_cookie(&stateful_get(&holder, "/state.asp", None));
+    let cookie_b = session_cookie(&stateful_get(&holder, "/state.asp", None));
+    assert_ne!(cookie_a, cookie_b);
+    let a2 = stateful_get(&holder, "/state.asp", Some(&cookie_a));
+    assert!(a2.body.contains("Your views: 2"), "{}", a2.body);
+    assert!(a2.body.contains("All views: 3"), "{}", a2.body);
+}

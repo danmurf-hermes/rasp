@@ -165,6 +165,22 @@ pub enum Stmt {
     },
     /// `Session("name") = expr`
     SessionAssign { name: String, value: Expr },
+    /// `Session.Contents("name") = expr` (same store as SessionAssign).
+    SessionContentsAssign { name: String, value: Expr },
+    /// `Session.Timeout = expr` (minutes).
+    SessionTimeoutAssign { value: Expr },
+    /// `Session.Abandon` — the session survives the request but the
+    /// session state is dropped at request end.
+    SessionAbandon,
+    /// `Application("name") = expr`
+    ApplicationAssign { name: String, value: Expr },
+    /// `Application.Contents("name") = expr` (same store).
+    ApplicationContentsAssign { name: String, value: Expr },
+    /// `Application.Lock` — flag only; enforcement arrives with
+    /// concurrent request handling.
+    ApplicationLock,
+    /// `Application.UnLock`.
+    ApplicationUnlock,
     /// Any `Response.verb [args...]` call statement, including
     /// property assignments (`Response.Status = "404 Not Found"`).
     ResponseCall { verb: String, args: Vec<Expr> },
@@ -239,6 +255,10 @@ pub enum Expr {
     Variable(String),
     /// `Session("name")` read.
     SessionRead(String),
+    /// `Application("name")` or `Application.Contents("name")` read.
+    ApplicationRead(String),
+    /// `Session.SessionID`.
+    SessionIdRead,
     /// `Request.String("key")` read — wired to per-request data.
     RequestRead {
         collection: String,
@@ -287,6 +307,12 @@ struct P {
 impl P {
     fn peek(&self) -> &Tok {
         self.tokens.get(self.pos).unwrap_or(&Tok::LineEnd)
+    }
+
+    /// The token two positions ahead (two-token lookahead without
+    /// consuming; used to tell `Session("k") = v` from `Session.Timeout`).
+    fn peek_two(&self) -> &Tok {
+        self.tokens.get(self.pos + 1).unwrap_or(&Tok::LineEnd)
     }
 
     fn advance(&mut self) {
@@ -357,7 +383,21 @@ impl P {
             Tok::Name(name) if name == "sub" => self.parse_proc(false),
             Tok::Name(name) if name == "function" => self.parse_proc(true),
             Tok::Name(name) if name == "end" => self.parse_end(),
-            Tok::Name(name) if name == "session" => self.parse_session_target(),
+            Tok::Name(name) if name == "session" => {
+                // `Session("k") = v` vs a `Session.member` statement form.
+                if matches!(self.peek_two(), Tok::Sym(s) if s == "(") {
+                    self.parse_session_target()
+                } else {
+                    self.parse_state_object_stmt("session")
+                }
+            }
+            Tok::Name(name) if name == "application" => {
+                if matches!(self.peek_two(), Tok::Sym(s) if s == "(") {
+                    self.parse_application_target()
+                } else {
+                    self.parse_state_object_stmt("application")
+                }
+            }
             Tok::Name(name) if name == "call" => self.parse_call_keyword(),
             Tok::Name(name) if is_reserved(&name) => Err(self.error(format!(
                 "VBScript feature '{name}' is not supported in Milestone 2"
@@ -702,7 +742,21 @@ impl P {
             Tok::Name(name) if name == "do" => self.parse_do(),
             Tok::Name(name) if name == "exit" => self.parse_exit(),
             Tok::Name(name) if name == "response" => self.parse_response_stmt(),
-            Tok::Name(name) if name == "session" => self.parse_session_target(),
+            Tok::Name(name) if name == "session" => {
+                // `Session("k") = v` vs a `Session.member` statement form.
+                if matches!(self.peek_two(), Tok::Sym(s) if s == "(") {
+                    self.parse_session_target()
+                } else {
+                    self.parse_state_object_stmt("session")
+                }
+            }
+            Tok::Name(name) if name == "application" => {
+                if matches!(self.peek_two(), Tok::Sym(s) if s == "(") {
+                    self.parse_application_target()
+                } else {
+                    self.parse_state_object_stmt("application")
+                }
+            }
             Tok::Name(name) if name == "call" => self.parse_call_keyword(),
             Tok::Name(name) if name == "sub" || name == "function" => {
                 let is_function = name == "function";
@@ -1075,17 +1129,117 @@ impl P {
     fn parse_session_target(&mut self) -> AspResult<Stmt> {
         self.advance();
         self.expect_sym("(")?;
-        let key = match self.parse_expr()? {
-            Expr::Literal(Variant::Str(s)) => s,
-            _ => {
-                return Err(self.error("Session requires a string key"));
-            }
-        };
+        let key = self.parse_state_key()?;
         self.expect_sym(")")?;
         self.expect_sym("=")?;
         let value = self.parse_expr()?;
-        self.expect_line_end()?;
+        if matches!(self.peek(), Tok::LineEnd) {
+            self.advance();
+        }
         Ok(Stmt::SessionAssign { name: key, value })
+    }
+
+    /// `Application("name") = expr` as a statement.
+    fn parse_application_target(&mut self) -> AspResult<Stmt> {
+        self.advance();
+        self.expect_sym("(")?;
+        let key = self.parse_state_key()?;
+        self.expect_sym(")")?;
+        self.expect_sym("=")?;
+        let value = self.parse_expr()?;
+        if matches!(self.peek(), Tok::LineEnd) {
+            self.advance();
+        }
+        Ok(Stmt::ApplicationAssign { name: key, value })
+    }
+
+    /// `Session`/`Application` statement-position member forms:
+    /// `Session.Timeout = expr`, `Session.Abandon`,
+    /// `<Obj>.Contents("k") = expr`, `Session.StaticObjects` → clear
+    /// unsupported error.
+    fn parse_state_object_stmt(&mut self, object: &str) -> AspResult<Stmt> {
+        match object {
+            "session" => {}
+            "application" => {}
+            _ => unreachable!("only session/application route here"),
+        }
+        self.advance(); // the object name
+        self.expect_sym(".")?;
+        let member = match self.peek().clone() {
+            Tok::Name(n) => {
+                self.advance();
+                n
+            }
+            other => {
+                return Err(self.error(format!(
+                    "expected a member after '{object}.', found {}",
+                    other.describe()
+                )));
+            }
+        };
+        match member.as_str() {
+            "contents" => {
+                self.expect_sym("(")?;
+                let key = self.parse_state_key()?;
+                self.expect_sym(")")?;
+                self.expect_sym("=")?;
+                let value = self.parse_expr()?;
+                if matches!(self.peek(), Tok::LineEnd) {
+                    self.advance();
+                }
+                Ok(match object {
+                    "session" => Stmt::SessionContentsAssign { name: key, value },
+                    _ => Stmt::ApplicationContentsAssign { name: key, value },
+                })
+            }
+            "timeout" if object == "session" => {
+                self.expect_sym("=")?;
+                let value = self.parse_expr()?;
+                if matches!(self.peek(), Tok::LineEnd) {
+                    self.advance();
+                }
+                Ok(Stmt::SessionTimeoutAssign { value })
+            }
+            "abandon" if object == "session" => {
+                // `Session.Abandon` or `Session.Abandon()`.
+                if matches!(self.peek(), Tok::Sym(s) if s == "(") {
+                    self.advance();
+                    self.expect_sym(")")?;
+                }
+                if matches!(self.peek(), Tok::LineEnd) {
+                    self.advance();
+                }
+                Ok(Stmt::SessionAbandon)
+            }
+            "lock" if object == "application" => {
+                if matches!(self.peek(), Tok::LineEnd) {
+                    self.advance();
+                }
+                Ok(Stmt::ApplicationLock)
+            }
+            "unlock" if object == "application" => {
+                if matches!(self.peek(), Tok::LineEnd) {
+                    self.advance();
+                }
+                Ok(Stmt::ApplicationUnlock)
+            }
+            "staticobjects" => Err(self.error(
+                "Session.StaticObjects / Application.StaticObjects is not supported in Milestone 4",
+            )),
+            _ => Err(self.error(format!(
+                "'{object}.{member}' is not supported in Milestone 4"
+            ))),
+        }
+    }
+
+    /// The string-literal key inside `Session("k")`/`Application("k")`.
+    fn parse_state_key(&mut self) -> AspResult<String> {
+        match self.parse_expr()? {
+            Expr::Literal(Variant::Str(s)) => Ok(s),
+            _ => Err(self.error(
+                "Session/Application require a string key (variables as keys are not supported)",
+            )),
+        }
     }
 
     fn current_line(&self) -> usize {
@@ -1235,13 +1389,87 @@ impl P {
             }
             Tok::Name(n) if n == "session" => {
                 self.advance();
-                self.expect_sym("(")?;
-                let key = match self.parse_expr()? {
-                    Expr::Literal(Variant::Str(s)) => s,
-                    _ => return Err(self.error("Session requires a string key")),
+                if matches!(self.peek(), Tok::Sym(s) if s == "(") {
+                    self.advance();
+                    let key = match self.parse_expr()? {
+                        Expr::Literal(Variant::Str(s)) => s,
+                        _ => return Err(self.error("Session requires a string key")),
+                    };
+                    self.expect_sym(")")?;
+                    return Ok(Expr::SessionRead(key));
+                }
+                self.expect_sym(".")?;
+                let member = match self.peek().clone() {
+                    Tok::Name(m) => {
+                        self.advance();
+                        m
+                    }
+                    other => {
+                        return Err(self.error(format!(
+                            "expected a Session member, found {}",
+                            other.describe()
+                        )));
+                    }
                 };
-                self.expect_sym(")")?;
-                Ok(Expr::SessionRead(key))
+                match member.as_str() {
+                    "sessionid" => Ok(Expr::SessionIdRead),
+                    "contents" => {
+                        // `Session.Contents("k")` read expression.
+                        self.expect_sym("(")?;
+                        let key = match self.parse_expr()? {
+                            Expr::Literal(Variant::Str(s)) => s,
+                            _ => return Err(self.error("Session.Contents requires a string key")),
+                        };
+                        self.expect_sym(")")?;
+                        Ok(Expr::SessionRead(key))
+                    }
+                    _ => Err(self.error(format!(
+                        "'Session.{member}' is not supported in Milestone 4"
+                    ))),
+                }
+            }
+            Tok::Name(n) if n == "application" => {
+                self.advance();
+                if matches!(self.peek(), Tok::Sym(s) if s == "(") {
+                    self.advance();
+                    let key = match self.parse_expr()? {
+                        Expr::Literal(Variant::Str(s)) => s,
+                        _ => return Err(self.error("Application requires a string key")),
+                    };
+                    self.expect_sym(")")?;
+                    return Ok(Expr::ApplicationRead(key));
+                }
+                self.expect_sym(".")?;
+                let member = match self.peek().clone() {
+                    Tok::Name(m) => {
+                        self.advance();
+                        m
+                    }
+                    other => {
+                        return Err(self.error(format!(
+                            "expected an Application member, found {}",
+                            other.describe()
+                        )));
+                    }
+                };
+                match member.as_str() {
+                    "contents" => {
+                        self.expect_sym("(")?;
+                        let key = match self.parse_expr()? {
+                            Expr::Literal(Variant::Str(s)) => s,
+                            _ => {
+                                return Err(
+                                    self.error("Application.Contents requires a string key")
+                                );
+                            }
+                        };
+                        self.expect_sym(")")?;
+                        Ok(Expr::ApplicationRead(key))
+                    }
+                    _ => Err(self.error(format!(
+                        "'Application.{member}' is not supported in Milestone 4"
+                    ))),
+                }
             }
             Tok::Name(n) if n == "request" => {
                 self.advance();

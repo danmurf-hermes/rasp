@@ -9,10 +9,13 @@
 //! assets are not served — only `.asp` pages.
 
 use asp_core::AppRoot;
-use asp_runtime::{RenderOutput, build_request_data, render_page_with};
+use asp_runtime::{
+    GlobalAsa, RenderOutput, SESSION_COOKIE_NAME, SessionManager, StateStores, build_request_data,
+    fire_global_asa_events, render_page_stores, session::session_cookie_from_header,
+};
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Maximum accepted request body (form posts), bytes.
 const MAX_BODY_BYTES: usize = 1_048_576;
@@ -140,33 +143,127 @@ pub fn handle_request(app: &AppRoot, root_relative: &str, request: &HttpRequest)
 /// Runaway pages are stopped by the interpreter's own caps
 /// (`MAX_LOOP_ITERATIONS`, `MAX_CALL_DEPTH`) — they surface as 500s,
 /// not hangs; a wall-clock deadline cannot interrupt an in-flight
-/// tree-walk anyway.
+/// tree-walk anyway. Cross-request state (sessions, application,
+/// `global.asa`) lives in a [`ServerHolder`]; this entry point is the
+/// stateless compatibility shim over a throwaway holder.
 pub fn handle_request_for_server(
     app: &AppRoot,
     root_relative: &str,
     request: &HttpRequest,
     dev_errors: bool,
 ) -> HttpResponse {
+    let holder = ServerHolder::for_app_root(app).expect("holder builds when the app root exists");
+    handle_request_with_state(&holder, app, root_relative, request, dev_errors).0
+}
+
+/// Cross-request server state: the session manager (session store +
+/// application state) and the parsed `global.asa` (when the app root
+/// ships one). Shared by all requests of one `serve` process.
+pub struct ServerHolder {
+    manager: Mutex<SessionManager>,
+    global_asa: Option<GlobalAsa>,
+}
+
+impl ServerHolder {
+    /// Build from the app root. A `global.asa` that fails to parse is a
+    /// startup error (IIS refuses to start a broken application too).
+    pub fn for_app_root(app: &AppRoot) -> asp_core::AspResult<Self> {
+        let global_asa = match app.read_page("global.asa") {
+            Ok(source) => Some(GlobalAsa::parse(&source)?),
+            Err(asp_core::AspError::PageNotFound(_)) => None,
+            Err(err) => return Err(err),
+        };
+        Ok(Self {
+            manager: Mutex::new(SessionManager::new()),
+            global_asa,
+        })
+    }
+}
+
+/// Render one request THROUGH the cross-request state: resolve the
+/// session from the request's cookies, fire `global.asa` start events,
+/// render, and commit the mutated stores back. Returns the response
+/// plus a flag telling whether the session is new (for tests/drivers).
+pub fn handle_request_with_state(
+    holder: &ServerHolder,
+    app: &AppRoot,
+    root_relative: &str,
+    request: &HttpRequest,
+    dev_errors: bool,
+) -> (HttpResponse, bool) {
     // URL-length guard mirrors the server's pre-render limit.
     if request.path.len() + request.query.len() > MAX_URL_LENGTH {
-        return error_page(414, "URI Too Long", None);
+        return (error_page(414, "URI Too Long", None), false);
+    }
+    let cookie_value = session_cookie_from_header(&request.cookies);
+    let (store, session_cookie, is_new, application) = {
+        let mut manager = lock_manager(holder);
+        manager.resolve_request_state(cookie_value.as_deref())
+    };
+    let mut stores = StateStores {
+        session: store,
+        application,
+    };
+    if let Some(asa) = &holder.global_asa
+        && let Err(err) = fire_global_asa_events(asa, is_new, &mut stores)
+    {
+        // Event writes so far are committed even on event failure.
+        commit(holder, &session_cookie, &stores);
+        return (server_error_response(err, dev_errors), is_new);
     }
     let mut vars = request.server_variables();
     // IIS reports SCRIPT_NAME as the executing script (after default
     // document resolution), not the raw URL path.
     vars.insert("script_name".to_string(), format!("/{root_relative}"));
-    match render_page_with(app, root_relative, request.request_data(), vars) {
-        Ok(out) => to_response(out),
-        Err(asp_core::AspError::PageNotFound(_)) => error_page(404, "Not Found", None),
-        Err(err) => {
-            // Production: generic page, no internal detail. Dev: the
-            // full diagnostic in a <pre> block.
-            if dev_errors {
-                error_page(500, "Server error", Some(err.to_string()))
-            } else {
-                error_page(500, "Server error", None)
+    match render_page_stores(app, root_relative, request.request_data(), vars, &stores) {
+        Ok((out, exit_stores)) => {
+            commit(holder, &session_cookie, &exit_stores);
+            let mut response = to_response(out);
+            if is_new {
+                response
+                    .set_cookies
+                    .push(format!("{SESSION_COOKIE_NAME}={session_cookie}"));
             }
+            (response, is_new)
         }
+        Err(asp_core::AspError::PageNotFound(_)) => {
+            commit(holder, &session_cookie, &stores);
+            (error_page(404, "Not Found", None), is_new)
+        }
+        Err(err) => {
+            // State writes survive a page error (session values set
+            // before the error stay set), so commit what we have.
+            commit(holder, &session_cookie, &stores);
+            (server_error_response(err, dev_errors), is_new)
+        }
+    }
+}
+
+/// Commit the stores back to the manager under its lock.
+fn commit(holder: &ServerHolder, session_cookie: &str, stores: &StateStores) {
+    let mut manager = lock_manager(holder);
+    manager.commit_request_state(
+        session_cookie,
+        stores.session.clone(),
+        stores.application.clone(),
+    );
+}
+
+/// Lock the manager, recovering from poisoning (a request that panicked
+/// mid-render must not brick every later request).
+fn lock_manager(holder: &ServerHolder) -> std::sync::MutexGuard<'_, SessionManager> {
+    match holder.manager.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Produce the 500 response for a render failure (dev vs production).
+fn server_error_response(err: asp_core::AspError, dev_errors: bool) -> HttpResponse {
+    if dev_errors {
+        error_page(500, "Server error", Some(err.to_string()))
+    } else {
+        error_page(500, "Server error", None)
     }
 }
 
@@ -227,8 +324,10 @@ fn html_escape(s: &str) -> String {
 }
 
 /// Run the blocking HTTP server loop until the process is stopped.
-/// Returns an error only when the listener cannot be created.
+/// Returns an error only when the listener or `global.asa` cannot be
+/// initialised.
 pub fn serve(app: &AppRoot, config: &ServerConfig) -> asp_core::AspResult<()> {
+    let holder = Arc::new(ServerHolder::for_app_root(app)?);
     let addr = format!("{}:{}", config.host, config.port);
     let server = tiny_http::Server::http(&addr)
         .map_err(|e| asp_core::AspError::Io(format!("cannot bind {addr}: {e}")))?;
@@ -268,8 +367,13 @@ pub fn serve(app: &AppRoot, config: &ServerConfig) -> asp_core::AspResult<()> {
             headers,
         };
         let root_relative = resolve_request_path(app, &config, &http_request.path);
-        let response =
-            handle_request_for_server(app, &root_relative, &http_request, config.dev_errors);
+        let (response, _) = handle_request_with_state(
+            &holder,
+            app,
+            &root_relative,
+            &http_request,
+            config.dev_errors,
+        );
         let _ = request.respond(tiny_response(response));
     }
 }
@@ -530,7 +634,15 @@ mod tests {
         let config = ServerConfig::default();
         let rel = resolve_request_path(&app, &config, "/sc.asp");
         let response = handle_request(&app, &rel, &request("/sc.asp", "x=1"));
-        assert_eq!(response.set_cookies, vec!["pref=dark".to_string()]);
+        // The page's own cookie first, then the session cookie every new
+        // visitor gets (IIS behaviour).
+        assert_eq!(
+            response.set_cookies,
+            vec![
+                "pref=dark".to_string(),
+                "ASPSESSIONID=rasp00000001".to_string()
+            ]
+        );
         assert_eq!(response.body, "1");
     }
 
@@ -558,5 +670,273 @@ mod tests {
         // Dev mode shows the diagnostic instead.
         let dev = handle_request_for_server(&app, &rel, &request("/x.asp", ""), true);
         assert!(dev.body.contains("division by zero"));
+    }
+
+    // ---- Milestone 4: cross-request state ----
+
+    /// One holder over one app root, and a request with optional cookie.
+    fn stateful(
+        holder: &ServerHolder,
+        app: &AppRoot,
+        path: &str,
+        query: &str,
+        cookies: &str,
+        method: &str,
+        form: &str,
+    ) -> HttpResponse {
+        let config = ServerConfig::default();
+        let rel = resolve_request_path(app, &config, path);
+        let req = HttpRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            query: query.to_string(),
+            form: form.to_string(),
+            cookies: cookies.to_string(),
+            headers: Vec::new(),
+        };
+        handle_request_with_state(holder, app, &rel, &req, true).0
+    }
+
+    fn set_cookie_value(response: &HttpResponse) -> Option<String> {
+        response
+            .set_cookies
+            .iter()
+            .find(|c| c.to_ascii_lowercase().starts_with("aspsessionid"))
+            .map(|c| c.split_once('=').unwrap().1.to_string())
+    }
+
+    #[test]
+    fn session_persists_across_requests_with_cookie() {
+        let root = build_app("sess1");
+        fs::write(root.join("set.asp"), "<% Session(\"user\") = \"dan\" %>set").unwrap();
+        fs::write(root.join("get.asp"), "<%= Session(\"user\") %>").unwrap();
+        let app = AppRoot::new(&root);
+        let holder = ServerHolder::for_app_root(&app).unwrap();
+        let first = stateful(&holder, &app, "/set.asp", "", "", "GET", "");
+        let cookie = set_cookie_value(&first).expect("session cookie on first visit");
+        let second = stateful(
+            &holder,
+            &app,
+            "/get.asp",
+            "",
+            &format!("ASPSESSIONID={cookie}"),
+            "GET",
+            "",
+        );
+        assert_eq!(second.body, "dan");
+    }
+
+    #[test]
+    fn session_needs_the_cookie_otherwise_new() {
+        let root = build_app("sess2");
+        fs::write(root.join("set.asp"), "<% Session(\"u\") = \"dan\" %>set").unwrap();
+        fs::write(root.join("get.asp"), "<%= Session(\"u\") %>").unwrap();
+        let app = AppRoot::new(&root);
+        let holder = ServerHolder::for_app_root(&app).unwrap();
+        let first = stateful(&holder, &app, "/set.asp", "", "", "GET", "");
+        assert_eq!(first.body, "set");
+        // Without sending the cookie back, a NEW session reads empty.
+        let second = stateful(&holder, &app, "/get.asp", "", "", "GET", "");
+        assert_eq!(second.body, "");
+    }
+
+    #[test]
+    fn sessions_are_isolated_per_visitor() {
+        let root = build_app("sess3");
+        fs::write(
+            root.join("p.asp"),
+            "<% If Session(\"who\") = Empty Then\nSession(\"who\") = Request.QueryString(\"as\")\nEnd If\n%><%= Session(\"who\") %>",
+        )
+        .unwrap();
+        let app = AppRoot::new(&root);
+        let holder = ServerHolder::for_app_root(&app).unwrap();
+        let a = set_cookie_value(&stateful(
+            &holder, &app, "/p.asp", "as=alice", "", "GET", "",
+        ))
+        .unwrap();
+        let b =
+            set_cookie_value(&stateful(&holder, &app, "/p.asp", "as=bob", "", "GET", "")).unwrap();
+        assert_ne!(a, b);
+        let a2 = stateful(
+            &holder,
+            &app,
+            "/p.asp",
+            "as=zoe",
+            &format!("ASPSESSIONID={a}"),
+            "GET",
+            "",
+        );
+        let b2 = stateful(
+            &holder,
+            &app,
+            "/p.asp",
+            "as=zoe",
+            &format!("ASPSESSIONID={b}"),
+            "GET",
+            "",
+        );
+        assert_eq!(a2.body, "alice");
+        assert_eq!(b2.body, "bob");
+    }
+
+    #[test]
+    fn session_abandon_drops_values_for_next_request() {
+        let root = build_app("sess4");
+        fs::write(
+            root.join("p.asp"),
+            "<% Session(\"n\") = Session(\"n\") + 1 %><%= Session(\"n\") %>",
+        )
+        .unwrap();
+        fs::write(root.join("bye.asp"), "<% Session.Abandon %>bye").unwrap();
+        let app = AppRoot::new(&root);
+        let holder = ServerHolder::for_app_root(&app).unwrap();
+        let first = stateful(&holder, &app, "/p.asp", "", "", "GET", "");
+        let cookie = set_cookie_value(&first).unwrap();
+        assert_eq!(first.body, "1");
+        let second = stateful(
+            &holder,
+            &app,
+            "/p.asp",
+            "",
+            &format!("ASPSESSIONID={cookie}"),
+            "GET",
+            "",
+        );
+        assert_eq!(second.body, "2");
+        let bye = stateful(
+            &holder,
+            &app,
+            "/bye.asp",
+            "",
+            &format!("ASPSESSIONID={cookie}"),
+            "GET",
+            "",
+        );
+        assert_eq!(bye.body, "bye");
+        let after = stateful(
+            &holder,
+            &app,
+            "/p.asp",
+            "",
+            &format!("ASPSESSIONID={cookie}"),
+            "GET",
+            "",
+        );
+        assert_eq!(after.body, "1");
+    }
+
+    #[test]
+    fn application_shared_across_sessions() {
+        let root = build_app("app1");
+        fs::write(
+            root.join("hit.asp"),
+            "<% Application.Lock\nApplication(\"hits\") = Application(\"hits\") + 1\nApplication.UnLock\n%><%= Application(\"hits\") %>",
+        )
+        .unwrap();
+        let app = AppRoot::new(&root);
+        let holder = ServerHolder::for_app_root(&app).unwrap();
+        let a = set_cookie_value(&stateful(&holder, &app, "/hit.asp", "", "", "GET", "")).unwrap();
+        let b = set_cookie_value(&stateful(&holder, &app, "/hit.asp", "", "", "GET", "")).unwrap();
+        assert_ne!(a, b);
+        let a2 = stateful(
+            &holder,
+            &app,
+            "/hit.asp",
+            "",
+            &format!("ASPSESSIONID={a}"),
+            "GET",
+            "",
+        );
+        let b2 = stateful(
+            &holder,
+            &app,
+            "/hit.asp",
+            "",
+            &format!("ASPSESSIONID={b}"),
+            "GET",
+            "",
+        );
+        // Two different sessions incremented the same shared counter;
+        // the first request was hit #1, then each follow-up adds one.
+        assert_eq!(a2.body, "3");
+        assert_eq!(b2.body, "4");
+    }
+
+    #[test]
+    fn global_asa_events_fire_once_per_process_and_per_session() {
+        let root = build_app("asa");
+        fs::write(
+            root.join("global.asa"),
+            "<SCRIPT RUNAT=Server LANGUAGE=VBScript>\nSub Application_OnStart\nApplication(\"boot\") = \"on\"\nEnd Sub\n</SCRIPT>\n<SCRIPT RUNAT=Server LANGUAGE=VBScript>\nSub Session_OnStart\nSession(\"visits\") = 1\nEnd Sub\n</SCRIPT>",
+        )
+        .unwrap();
+        fs::write(
+            root.join("p.asp"),
+            "<%= Application(\"boot\") & \":\" & Session(\"visits\") %>",
+        )
+        .unwrap();
+        let app = AppRoot::new(&root);
+        let holder = ServerHolder::for_app_root(&app).unwrap();
+        let a = set_cookie_value(&stateful(&holder, &app, "/p.asp", "", "", "GET", "")).unwrap();
+        let first = stateful(&holder, &app, "/p.asp", "", "", "GET", "");
+        assert_eq!(first.body, "on:1");
+        let second = stateful(
+            &holder,
+            &app,
+            "/p.asp",
+            "",
+            &format!("ASPSESSIONID={a}"),
+            "GET",
+            "",
+        );
+        // Session_OnStart must NOT fire again; app values persist.
+        assert_eq!(second.body, "on:1");
+    }
+
+    #[test]
+    fn server_script_procedures_are_visible_to_pages() {
+        let root = build_app("srvscript");
+        fs::write(
+            root.join("lib.inc"),
+            "<SCRIPT RUNAT=Server LANGUAGE=\"VBScript\">\nSub shout(t)\nResponse.Write UCase(t)\nEnd Sub\n</SCRIPT>",
+        )
+        .unwrap();
+        fs::write(
+            root.join("p.asp"),
+            "<!-- #include file=\"lib.inc\" --><% shout \"hey\" %>",
+        )
+        .unwrap();
+        let app = AppRoot::new(&root);
+        let holder = ServerHolder::for_app_root(&app).unwrap();
+        let response = stateful(&holder, &app, "/p.asp", "", "", "GET", "");
+        assert_eq!(response.body, "HEY");
+    }
+
+    #[test]
+    fn session_timeout_persists_in_the_store() {
+        let root = build_app("timeout");
+        fs::write(root.join("p.asp"), "<% Session.Timeout = 45 %>").unwrap();
+        fs::write(
+            root.join("q.asp"),
+            "<% If Session(\"t\") = Empty Then\nSession(\"t\") = 1\nEnd If\n%>ok",
+        )
+        .unwrap();
+        let app = AppRoot::new(&root);
+        let holder = ServerHolder::for_app_root(&app).unwrap();
+        let first = stateful(&holder, &app, "/p.asp", "", "", "GET", "");
+        let cookie = set_cookie_value(&first).unwrap();
+        // Timeout itself is not directly observable from script; the
+        // store round-trip (no expiry on next request) is the gate.
+        let second = stateful(
+            &holder,
+            &app,
+            "/q.asp",
+            "",
+            &format!("ASPSESSIONID={cookie}"),
+            "GET",
+            "",
+        );
+        assert_eq!(second.body, "ok");
+        assert_eq!(set_cookie_value(&second), None);
     }
 }
