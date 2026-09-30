@@ -863,7 +863,7 @@ Definition of done:
 
 ### Milestone 3 — Request and response model
 
-**Status:** Not started
+**Status:** Built
 
 Deliverables:
 
@@ -1012,7 +1012,6 @@ This checklist applies before every pull request is marked ready for review.
 
 ## 12. Immediate next steps
 
-1. Milestone 3 — request and response model: `Request.Form`/`Cookies`/`ServerVariables`, `Response.Redirect`/`ContentType`/cookies/status, request timeouts and body-size limits, proper error responses.
+1. Milestone 4 — includes, sessions, and application state: Session cookie + in-process store, `Session`/`Application` objects, basic `global.asa` events (`Session_OnStart`/`Application_OnStart`).
 2. Finish the variant-semantics workstream: multi-dimensional arrays, `Byte`/binary data (`Request.BinaryRead`/`Response.BinaryWrite`), and a documented coercion table.
-3. Golden tests for each new Response/Request feature as it lands.
-4. Keep `AGENTS.md` in step with new conventions as they emerge (note: the M2 executor's normalization pass over deferred delimiters is the load-bearing architecture for cross-block and nested constructs).
+3. Keep `AGENTS.md` in step with new conventions as they emerge (note: the M2 executor's normalization pass over deferred delimiters is the load-bearing architecture for cross-block and nested constructs).
