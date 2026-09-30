@@ -30,8 +30,8 @@ cargo test --all
 
 ## Architecture invariants
 
-- Cross-block loops flatten into one statement stream via `flatten_steps`; `exec_block` deliberately errors on loop openers.
-- Loop openers (`ForLoopOpen`, `DoOpen`) are separate `Stmt` variants; the executor pairs `Next`/`Loop` with the innermost opener.
+- Cross-block loops flatten into one statement stream via `flatten_steps`; the parser emits **deferred delimiters** (`ForLoopOpen`/`Next`, `DoOpen`/`LoopClose`/`DoClose`, `ProcOpen`/`ProcClose`) and `exec_block_loops` runs a normalization pass that pairs them (rejecting mismatched closers), hoists `Sub`/`Function` declarations, and executes the resulting nested statement tree — that pass is what keeps nested loops and hoisted procedures correct.
 - `Response.Write <expr>` takes a full expression; a leading `(` is a parenthesised operand.
 - Statements separate on `Tok::LineEnd`; `consume_loop_tail` eats only the optional `Next i` name, never `While`/`Until`/`Loop`/`For`.
 - Ordinary HTML comments pass through; only `<!-- #include ... -->` is consumed.
+- Goldens may change only with an explained diff (e.g. the M2 fix that stopped the loop body running once before the first iteration).

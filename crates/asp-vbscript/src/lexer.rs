@@ -38,12 +38,14 @@ impl Tok {
     }
 }
 
-/// True for VBScript reserved words the M1 grammar reserves.
+/// True for VBScript reserved words with no M2 statement form yet
+/// (`Set`, `On Error`, `With`, `Select Case` raise clear diagnostics;
+/// `Sub`/`Function`/`Exit`/`End`/`ReDim` are parsed as statements).
 pub fn is_reserved(name: &str) -> bool {
-    const RESERVED: [&str; 30] = [
-        "if", "then", "else", "elseif", "end", "for", "to", "next", "do", "while", "until", "loop",
-        "dim", "redim", "const", "sub", "function", "exit", "set", "call", "on", "error", "resume",
-        "class", "with", "select", "case", "not", "and", "or",
+    const RESERVED: [&str; 26] = [
+        "if", "then", "else", "elseif", "for", "to", "next", "do", "while", "until", "loop", "dim",
+        "redim", "const", "set", "call", "on", "error", "resume", "class", "with", "select",
+        "case", "not", "and", "or",
     ];
     let name = name.to_ascii_lowercase();
     RESERVED.contains(&name.as_str())

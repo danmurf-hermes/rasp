@@ -1,8 +1,10 @@
 //! RASP command-line executable.
 //!
-//! Milestone 1: `serve` hosts an ASP application over HTTP, `run`
+//! Milestone 2: `serve` hosts an ASP application over HTTP, `run`
 //! renders one page against a synthetic GET request, and `check`
-//! syntax-checks every `.asp` file under a directory.
+//! syntax-checks every `.asp` file under a directory. The language
+//! engine now covers the M2 core subset (arrays, procedures, Exit,
+//! conversions, Date/Time) on top of M1's page model.
 
 use asp_core::{AppRoot, AspError};
 use asp_http::{ServerConfig, serve as http_serve};

@@ -8,13 +8,18 @@ RASP runs existing Classic ASP applications from a single Rust binary (or a
 Docker image) on Linux, macOS, Windows, or any platform that supports
 containers — no Windows or IIS required.
 
-## Status: Hello ASP (Milestone 1)
+## Status: Core language subset (Milestone 2)
 
 Workstreams and milestones are tracked in
 [docs/asp-classic-interpreter-plan.md](docs/asp-classic-interpreter-plan.md).
 The interpreter renders real pages: VBScript expressions, control flow
 (`If`, `For`/`Next`, `Do`/`Loop` — including bodies that interleave
-markup across `<% %>` blocks), `Response.Write`/`End`/`Clear`,
+markup across `<% %>` blocks, nested loops, `Exit For`/`Exit Do`),
+fixed-size arrays and `Array()`/`UBound`/`Split`/`Join`,
+`Sub`/`Function` procedures with `Call` and ByRef/ByVal parameters,
+conversions (`CInt`/`CLng` with banker's rounding, `CDbl`, `CBool`,
+`CDate`, `Is*`), Date/Time functions (`DateSerial`, `DateAdd`,
+`DateDiff`, `Year`/`Month`/`Day`/…), `Response.Write`/`End`/`Clear`,
 `Request.QueryString`, and `#include` directives, served over HTTP.
 
 ## Quick start

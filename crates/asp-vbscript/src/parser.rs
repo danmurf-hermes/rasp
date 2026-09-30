@@ -1,18 +1,34 @@
 //! Hand-written recursive-descent parser and AST for the classic ASP
-//! subset of VBScript, and the deterministic evaluator for it.
+//! subset of VBScript, plus the shared [`Variant`] value type.
 //!
-//! M1 covers: literals, variables, `Dim`, `Const`, assignment, the
-//! arithmetic / concatenation / comparison / logical operators, `If`
-//! (single-line and block), `For ... Next`, `Do While|Until ... Loop`,
-//! `Response.Write`, `Response.Buffer`, and `Session("name") = value`.
-//! Unsupported constructs (Sub/Function/objects/arrays) produce clear
-//! `Unsupported` diagnostics instead of misbehaving.
+//! M2 covers everything M1 did — literals, variables, `Dim`, `Const`,
+//! assignment, arithmetic / concatenation / comparison / logical
+//! operators, `If` (single-line and block), `For ... Next`,
+//! `Do ... Loop`, `Response.Write`, and `Session` — and adds:
+//!
+//! - fixed-size arrays (`Dim a(3)`), indexed reads/stores, `Array()`;
+//! - procedures: `Sub`/`Function ... End Sub/Function` and `Call`;
+//! - `Exit For`/`Exit Do`/`Exit Sub`/`Exit Function`;
+//! - conversions (`CInt`/`CLng` with VBScript banker's rounding,
+//!   `CDbl`, `CBool`, `CStr`, `CDate`, `Is*`) and Date/Time builtins.
+//!
+//! Loop and procedure bodies are **deferred**: `ForLoopOpen`/`Next`,
+//! `DoOpen`/`LoopClose`/`DoClose`, and `ProcOpen`/`ProcClose` pair up
+//! in the evaluator's nesting pass. This is what lets Classic ASP
+//! split a loop across `<% %>` blocks with literal markup re-emitted
+//! per iteration — `For` in one block, `Next` in a later one.
+//! Block `If` bodies still nest structurally and must live inside one
+//! `<% %>` block (documented M1 limitation, unchanged).
+//!
+//! `ReDim`, `Set`, `On Error`, `With`, `Select Case`, `Class`, and
+//! object members outside Response/Request produce clear
+//! "not supported in Milestone 2" diagnostics.
 
 use crate::lexer::{Tok, is_reserved, lex};
 use asp_core::{AspError, AspResult};
 
-/// One evaluated expression value. VBScript has only Variant; M1 keeps
-/// the useful subset with real `Empty` semantics.
+/// One evaluated expression value. VBScript has only Variant; the
+/// language crates keep the useful subset with real `Empty` semantics.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Variant {
     /// Uninitialised; converts to "" when written, 0 in arithmetic.
@@ -25,6 +41,13 @@ pub enum Variant {
     Str(String),
     /// A value assigned through an object reference (`Set`); opaque.
     ObjectRef(String),
+    /// Date/time value (`Date`, `CDate`, date arithmetic) with
+    /// invariant ISO rendering and US-style implicit string parsing.
+    /// See `vb_datetime` for the accepted formats.
+    Date(chrono::NaiveDateTime),
+    /// Array value: fixed-size (`Dim a(3)`) or dynamic (`a = Array(...)`).
+    /// One dimension (indexes 0..=size); multi-dimensional arrives in M3.
+    Arr(Vec<Variant>),
 }
 
 impl Variant {
@@ -39,6 +62,13 @@ impl Variant {
             Variant::Bool(false) => "False".to_string(),
             Variant::Str(s) => s.clone(),
             Variant::ObjectRef(name) => name.clone(),
+            Variant::Date(d) => crate::vb_datetime::render(*d),
+            Variant::Arr(_) => {
+                // Arrays are not directly printable in VBScript (type
+                // mismatch); a harmless placeholder beats silently
+                // rendering bytes.
+                "(array)".to_string()
+            }
         }
     }
 
@@ -46,25 +76,34 @@ impl Variant {
     pub fn as_number(&self, line: usize) -> AspResult<f64> {
         match self {
             Variant::Empty => Ok(0.0),
-            Variant::Null => Err(AspError::Runtime(asp_core::Diagnostic::new(
-                line,
-                "invalid use of Null",
-            ))),
+            Variant::Null => Err(date_number_error(line, "invalid use of Null")),
             Variant::Int(i) => Ok(*i as f64),
             Variant::Float(f) => Ok(*f),
             Variant::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
-            Variant::Str(s) => parse_number(s).ok_or_else(|| {
-                AspError::Runtime(asp_core::Diagnostic::new(
-                    line,
-                    format!("type mismatch: cannot convert {s:?} to a number"),
-                ))
-            }),
-            Variant::ObjectRef(_) => Err(AspError::Runtime(asp_core::Diagnostic::new(
+            Variant::Date(d) => Ok(crate::vb_datetime::to_number(*d)),
+            Variant::Str(s) => match crate::vb_datetime::parse(s) {
+                Some(d) => Ok(crate::vb_datetime::to_number(d)),
+                None => parse_number(s).ok_or_else(|| {
+                    AspError::Runtime(asp_core::Diagnostic::new(
+                        line,
+                        format!("type mismatch: cannot convert {s:?} to a number"),
+                    ))
+                }),
+            },
+            Variant::ObjectRef(_) => Err(date_number_error(
                 line,
                 "type mismatch: object reference in arithmetic",
-            ))),
+            )),
+            Variant::Arr(_) => Err(date_number_error(
+                line,
+                "type mismatch: array used as a number",
+            )),
         }
     }
+}
+
+fn date_number_error(line: usize, message: &str) -> AspError {
+    AspError::Runtime(asp_core::Diagnostic::new(line, message))
 }
 
 /// Match VBScript's "up to 15 significant digits" float rendering.
@@ -108,12 +147,22 @@ pub fn parse_number(s: &str) -> Option<f64> {
 /// Statements.
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    /// `Dim name`
-    Dim { name: String },
-    /// `Const name = expr`
+    /// `Dim name` or `Dim name(size)` (fixed-size arrays only); further
+    /// comma-separated names ride along in `extra_names`.
+    Dim {
+        name: String,
+        size: Option<Expr>,
+        extra_names: Vec<(String, Option<Expr>)>,
+    },
+    /// `Const name = literal`
     Const { name: String, value: Variant },
-    /// `name = expr` (no `Set`); index targets arrive in M3.
-    Assign { name: String, value: Expr },
+    /// `name = expr` or `name(index) = expr` (array store); object `Set`
+    /// targets remain unsupported.
+    Assign {
+        name: String,
+        index: Option<Expr>,
+        value: Expr,
+    },
     /// `Session("name") = expr`
     SessionAssign { name: String, value: Expr },
     /// Any `Response.verb [args]` call statement.
@@ -132,7 +181,7 @@ pub enum Stmt {
         end: Expr,
         step: Option<Expr>,
     },
-    /// `Next` — closes the innermost open `For` (or `Do`-family) block.
+    /// `Next` — closes the innermost open `For`.
     Next,
     /// `Do [While|Until cond]` — body arrives up to the closing `Loop`.
     DoOpen {
@@ -149,6 +198,35 @@ pub enum Stmt {
         cond: Option<Expr>,
         while_form: bool,
     },
+    /// `Exit For` / `Exit Do`.
+    ExitLoop { for_form: bool },
+    /// `Exit Sub` / `Exit Function`.
+    ExitProc { function: bool },
+    /// `Sub name(params)` — body arrives up to `ProcClose`; hoisted by
+    /// the evaluator before execution (callable before definition).
+    ProcOpen {
+        name: String,
+        params: Vec<Param>,
+        is_function: bool,
+    },
+    /// `End Sub` / `End Function` — closes the innermost `ProcOpen`.
+    ProcClose,
+    /// `name [arg]` / `name arg1, arg2` / `Call name(args)` — a
+    /// procedure invocation in statement position. `wrapped` marks the
+    /// bare `name(arg)` form, which VBScript passes ByVal.
+    CallStmt {
+        name: String,
+        args: Vec<Expr>,
+        wrapped: bool,
+        line: usize,
+    },
+}
+
+/// One procedure parameter: `name` (ByRef-capable) or `ByVal name`.
+#[derive(Debug, Clone)]
+pub struct Param {
+    pub name: String,
+    pub by_val: bool,
 }
 
 /// Expressions.
@@ -167,10 +245,10 @@ pub enum Expr {
     Neg(Box<Expr>),
     Not(Box<Expr>),
     Binary(String, Box<Expr>, Box<Expr>),
-    /// Any builtin name call that is not an ASP intrinsic object.
+    /// Any call with a callee name: script-defined functions shadow
+    /// builtins; `name(index)` array reads resolve at evaluation when
+    /// the name holds an array (parens serve both).
     Builtin(String, Vec<Expr>, usize),
-    /// A method call on the Response object for value-returning use.
-    ResponseValue(String),
 }
 
 /// Parse one `<%` block body (source text) into a statement list.
@@ -270,13 +348,14 @@ impl P {
                 self.consume_loop_tail()?;
                 Ok(Stmt::LoopClose)
             }
+            Tok::Name(name) if name == "exit" => self.parse_exit(),
+            Tok::Name(name) if name == "sub" => self.parse_proc(false),
+            Tok::Name(name) if name == "function" => self.parse_proc(true),
+            Tok::Name(name) if name == "end" => self.parse_end(),
             Tok::Name(name) if name == "session" => self.parse_session_target(),
-            Tok::Name(name) if name == "call" => {
-                self.advance();
-                self.parse_statement()
-            }
+            Tok::Name(name) if name == "call" => self.parse_call_keyword(),
             Tok::Name(name) if is_reserved(&name) => Err(self.error(format!(
-                "VBScript feature '{name}' is not supported in Milestone 1"
+                "VBScript feature '{name}' is not supported in Milestone 2"
             ))),
             Tok::Name(name) => {
                 self.advance();
@@ -285,20 +364,111 @@ impl P {
                         self.advance();
                         let value = self.parse_expr()?;
                         self.expect_line_end()?;
-                        Ok(Stmt::Assign { name, value })
+                        Ok(Stmt::Assign {
+                            name,
+                            index: None,
+                            value,
+                        })
+                    }
+                    Tok::Sym(op) if op == "(" => {
+                        // `name(index) = expr` (array store) or
+                        // `name(args)` / `name args...` (sub call).
+                        self.parse_name_then_paren(name)
                     }
                     Tok::Sym(op) if op == "." => {
                         // SomeObject.member — unsupported outside Response/Request.
                         let member = self.peek_member_name()?;
                         Err(self.error(format!(
-                            "object '{name}.{member}' is not supported in Milestone 1"
+                            "object '{name}.{member}' is not supported in Milestone 2"
                         )))
                     }
-                    _ => Err(self.error(format!("expected '=' after variable '{name}'"))),
+                    Tok::LineEnd => {
+                        // Bare name alone on a line: a zero-argument
+                        // sub call (`greet`).
+                        Ok(Stmt::CallStmt {
+                            name,
+                            args: Vec::new(),
+                            wrapped: false,
+                            line: 1,
+                        })
+                    }
+                    _ => self.parse_bare_call(name, 1),
                 }
             }
             other => Err(self.error(format!("expected a statement, found {}", other.describe()))),
         }
+    }
+
+    /// After `Name` with `(` peeked (not consumed): either an
+    /// array-element store `name(idx) = expr`, or a call. Lookahead:
+    /// parse one expression; if it is followed by `) =`, it is the
+    /// array store, otherwise rewind and treat the whole token run as
+    /// a call argument list.
+    fn parse_name_then_paren(&mut self, name: String) -> AspResult<Stmt> {
+        let save = self.pos;
+        self.advance(); // '('
+        if matches!(self.peek(), Tok::Sym(s) if s == ")") {
+            // `name()` — an empty argument list / undimensioned array:
+            // dynamic arrays (ReDim) are still out of scope.
+            return Err(self.error(format!(
+                "empty parentheses after '{name}'; dynamic arrays (ReDim) are not supported in Milestone 2"
+            )));
+        }
+        let first = match self.parse_expr() {
+            Ok(e) => e,
+            Err(_) => {
+                self.pos = save;
+                return self.parse_bare_call(name, 0);
+            }
+        };
+        if matches!(self.peek(), Tok::Sym(s) if s == ")")
+            && matches!(self.tokens.get(self.pos + 1), Some(Tok::Sym(s)) if s == "=")
+        {
+            self.advance(); // ')'
+            self.advance(); // '='
+            let value = self.parse_expr()?;
+            self.expect_line_end()?;
+            return Ok(Stmt::Assign {
+                name,
+                index: Some(first),
+                value,
+            });
+        }
+        self.pos = save;
+        self.parse_bare_call(name, 0)
+    }
+
+    /// `Name arg1, arg2` or `Name(args)` sub invocation in statement
+    /// position, without the `Call` keyword. `line` is the line the
+    /// statement started on (diagnostics only).
+    fn parse_bare_call(&mut self, name: String, line: usize) -> AspResult<Stmt> {
+        let mut args = Vec::new();
+        let mut wrapped = false;
+        if matches!(self.peek(), Tok::Sym(s) if s == "(") {
+            self.advance();
+            wrapped = true;
+            if !matches!(self.peek(), Tok::Sym(s) if s == ")") {
+                args.push(self.parse_expr()?);
+                while matches!(self.peek(), Tok::Sym(s) if s == ",") {
+                    self.advance();
+                    args.push(self.parse_expr()?);
+                }
+            }
+            self.expect_sym(")")?;
+        } else {
+            args.push(self.parse_expr()?);
+            while matches!(self.peek(), Tok::Sym(s) if s == ",") {
+                self.advance();
+                args.push(self.parse_expr()?);
+            }
+        }
+        self.expect_line_end()?;
+        Ok(Stmt::CallStmt {
+            name,
+            args,
+            wrapped,
+            line,
+        })
     }
 
     /// Consume `.name` after an object token and return the member name.
@@ -318,12 +488,20 @@ impl P {
 
     fn parse_dim(&mut self) -> AspResult<Stmt> {
         self.advance();
-        let mut names = Vec::new();
+        let mut names: Vec<(String, Option<Expr>)> = Vec::new();
         loop {
             match self.peek().clone() {
                 Tok::Name(n) => {
                     self.advance();
-                    names.push(n);
+                    let size = if matches!(self.peek(), Tok::Sym(s) if s == "(") {
+                        self.advance();
+                        let size = self.parse_expr()?;
+                        self.expect_sym(")")?;
+                        Some(size)
+                    } else {
+                        None
+                    };
+                    names.push((n, size));
                 }
                 other => {
                     return Err(self.error(format!(
@@ -339,10 +517,12 @@ impl P {
             }
         }
         self.expect_line_end()?;
-        // M1 lowers `Dim a, b` to a Dim of the first name; further names
-        // are declared implicitly on first assignment.
-        let name = names.remove(0);
-        Ok(Stmt::Dim { name })
+        let (name, size) = names.remove(0);
+        Ok(Stmt::Dim {
+            name,
+            size,
+            extra_names: names,
+        })
     }
 
     fn parse_const(&mut self) -> AspResult<Stmt> {
@@ -404,6 +584,52 @@ impl P {
         }
     }
 
+    /// `Exit For` / `Exit Do` / `Exit Sub` / `Exit Function`. Does not
+    /// consume the LineEnd: in a single-line If arm the caller owns the
+    /// boundary, and at line end the trailing newline is harmless
+    /// (skipped between statements).
+    fn parse_exit(&mut self) -> AspResult<Stmt> {
+        self.advance(); // exit
+        match self.peek().clone() {
+            Tok::Name(n) if n == "for" => {
+                self.advance();
+                Ok(Stmt::ExitLoop { for_form: true })
+            }
+            Tok::Name(n) if n == "do" => {
+                self.advance();
+                Ok(Stmt::ExitLoop { for_form: false })
+            }
+            Tok::Name(n) if n == "sub" || n == "function" => {
+                self.advance();
+                Ok(Stmt::ExitProc {
+                    function: n == "function",
+                })
+            }
+            other => Err(self.error(format!(
+                "expected For/Do/Sub/Function after Exit, found {}",
+                other.describe()
+            ))),
+        }
+    }
+
+    /// `End Sub` / `End Function` delimiters, plus precise errors for
+    /// stray `End If` / `End With` style statements.
+    fn parse_end(&mut self) -> AspResult<Stmt> {
+        self.advance(); // end
+        match self.peek().clone() {
+            Tok::Name(k) if k == "sub" || k == "function" => {
+                self.advance();
+                self.expect_line_end()?;
+                Ok(Stmt::ProcClose)
+            }
+            Tok::Name(k) if k == "if" => Err(self.error("'End If' without a matching 'If'")),
+            other => Err(self.error(format!(
+                "expected 'Sub' or 'Function' after 'End', found {}",
+                other.describe()
+            ))),
+        }
+    }
+
     /// `If cond Then stmt` (single-line) or the block form.
     fn parse_if(&mut self) -> AspResult<Stmt> {
         let line = self.current_line();
@@ -436,7 +662,11 @@ impl P {
                 line,
             });
         }
-        self.expect_line_end()?;
+        // The arm may already have consumed the line end (Response
+        // calls and Exit statements eat it); tolerate either way.
+        if matches!(self.peek(), Tok::LineEnd) {
+            self.advance();
+        }
         Ok(Stmt::If {
             branches: vec![(cond, vec![then_stmt])],
             else_body: None,
@@ -465,11 +695,13 @@ impl P {
             Tok::Name(name) if name == "if" => self.parse_if(),
             Tok::Name(name) if name == "for" => self.parse_for(),
             Tok::Name(name) if name == "do" => self.parse_do(),
+            Tok::Name(name) if name == "exit" => self.parse_exit(),
             Tok::Name(name) if name == "response" => self.parse_response_stmt(),
             Tok::Name(name) if name == "session" => self.parse_session_target(),
-            Tok::Name(name) if name == "call" => {
-                self.advance();
-                self.parse_statement_content()
+            Tok::Name(name) if name == "call" => self.parse_call_keyword(),
+            Tok::Name(name) if name == "sub" || name == "function" => {
+                let is_function = name == "function";
+                self.parse_proc(is_function)
             }
             // Assignments and Dim/Const forms end with their own LineEnd;
             // for single-line use these are unusual, so route everything
@@ -484,7 +716,11 @@ impl P {
                     self.advance();
                     let value = self.parse_expr()?;
                     // Consume nothing further: caller owns the boundary.
-                    return Ok(Stmt::Assign { name, value });
+                    return Ok(Stmt::Assign {
+                        name,
+                        index: None,
+                        value,
+                    });
                 }
                 Err(self.error(format!("expected '=' after variable '{name}'")))
             }
@@ -557,6 +793,8 @@ impl P {
         }
     }
 
+    /// `For name = a To b [Step s]` — opener only; the body pairs up
+    /// at the matching `Next` in the evaluator's nesting pass.
     fn parse_for(&mut self) -> AspResult<Stmt> {
         self.advance(); // for
         let var = match self.peek().clone() {
@@ -651,6 +889,116 @@ impl P {
             self.advance();
         }
         self.expect_line_end()
+    }
+
+    /// `Sub name(params)` / `Function name(params)` — opener only; the
+    /// body pairs up at `ProcClose` in the evaluator's nesting pass,
+    /// which also hoists the procedure so it can be called before its
+    /// textual definition.
+    fn parse_proc(&mut self, is_function: bool) -> AspResult<Stmt> {
+        self.advance(); // sub | function
+        let name = match self.peek().clone() {
+            Tok::Name(n) if !is_reserved(&n) => {
+                self.advance();
+                n
+            }
+            other => {
+                return Err(self.error(format!(
+                    "expected a name after {}, found {}",
+                    if is_function { "Function" } else { "Sub" },
+                    other.describe()
+                )));
+            }
+        };
+        let params = self.parse_param_list()?;
+        self.expect_line_end()?;
+        Ok(Stmt::ProcOpen {
+            name,
+            params,
+            is_function,
+        })
+    }
+
+    /// `(a, ByVal b, c)` — an optional parameter list.
+    fn parse_param_list(&mut self) -> AspResult<Vec<Param>> {
+        let mut params = Vec::new();
+        if matches!(self.peek(), Tok::Sym(s) if s == "(") {
+            self.advance();
+            if !matches!(self.peek(), Tok::Sym(s) if s == ")") {
+                loop {
+                    let mut by_val = false;
+                    if let Tok::Name(n) = self.peek().clone()
+                        && (n == "byval" || n == "byref")
+                    {
+                        by_val = n == "byval";
+                        self.advance();
+                    }
+                    let name = match self.peek().clone() {
+                        Tok::Name(n) if !is_reserved(&n) => {
+                            self.advance();
+                            n
+                        }
+                        other => {
+                            return Err(self.error(format!(
+                                "expected a parameter name, found {}",
+                                other.describe()
+                            )));
+                        }
+                    };
+                    params.push(Param { name, by_val });
+                    if matches!(self.peek(), Tok::Sym(s) if s == ",") {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect_sym(")")?;
+        }
+        Ok(params)
+    }
+
+    /// `Call name(args)` / `Call name arg`.
+    fn parse_call_keyword(&mut self) -> AspResult<Stmt> {
+        self.advance(); // call
+        match self.peek().clone() {
+            Tok::Name(n) if !is_reserved(&n) => {
+                let name = n;
+                self.advance();
+                let mut args = Vec::new();
+                if matches!(self.peek(), Tok::Sym(s) if s == "(") {
+                    self.advance();
+                    if !matches!(self.peek(), Tok::Sym(s) if s == ")") {
+                        args.push(self.parse_expr()?);
+                        while matches!(self.peek(), Tok::Sym(s) if s == ",") {
+                            self.advance();
+                            args.push(self.parse_expr()?);
+                        }
+                    }
+                    self.expect_sym(")")?;
+                } else if !matches!(self.peek(), Tok::LineEnd) {
+                    args.push(self.parse_expr()?);
+                    while matches!(self.peek(), Tok::Sym(s) if s == ",") {
+                        self.advance();
+                        args.push(self.parse_expr()?);
+                    }
+                }
+                let line = self.current_line();
+                self.expect_line_end()?;
+                // `wrapped=false`: Call's parens are list syntax, so
+                // arguments keep ByRef (bare `f (x)` is the ByVal form).
+                Ok(Stmt::CallStmt {
+                    name,
+                    args,
+                    wrapped: false,
+                    line,
+                })
+            }
+            other => Err(self.error(format!(
+                "expected a procedure name after Call, found {}",
+                other.describe()
+            ))),
+        }
     }
 
     /// `Response.<verb>` as a statement; verbs checked against a whitelist.
@@ -836,10 +1184,10 @@ impl P {
                 Ok(Expr::Literal(Variant::Bool(true)))
             }
             Tok::Name(n) if n == "response" => {
-                // Expression-position Response calls are beyond M1's
+                // Expression-position Response calls are beyond the M2
                 // grammar; statement-position `Response.<verb>` is parsed
                 // by `parse_response_stmt`.
-                Err(self.error("Response in expression position is not supported in Milestone 1"))
+                Err(self.error("Response in expression position is not supported in Milestone 2"))
             }
             Tok::Name(n) if n == "false" => {
                 self.advance();
