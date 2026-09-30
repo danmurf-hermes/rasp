@@ -234,8 +234,9 @@ Current state:
 - CI quality job runs `cargo fmt --check`, clippy, and `cargo test --all` on
   Ubuntu and macOS, plus a Docker build/run smoke test.
 - `Dockerfile` builds the release binary into a non-root `debian` runtime
-  image; `cargo fmt` and `cargo clippy` are the effective formatting and lint
-  configuration (no `rustfmt.toml` needed).
+  image (numeric `USER 1000`, because `debian:stable-slim` ships no
+  `adduser`); `cargo fmt` and `cargo clippy` are the effective formatting and
+  lint configuration (no `rustfmt.toml` needed).
 
 Create:
 

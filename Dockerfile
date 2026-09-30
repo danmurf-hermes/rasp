@@ -11,11 +11,11 @@ RUN cargo build --release -p asp-cli
 # Runtime stage: minimal image, non-root user, placeholder binary only.
 FROM debian:stable-slim AS runtime
 
-RUN adduser --system --group --home /app app
-
 COPY --from=builder /build/target/release/rasp /usr/local/bin/rasp
 
-USER app
+# debian:stable-slim ships no `adduser`; a dedicated numeric UID keeps the
+# runtime stage minimal while guaranteeing a non-root process.
+USER 1000:1000
 WORKDIR /app
 
 ENTRYPOINT ["/usr/local/bin/rasp"]
