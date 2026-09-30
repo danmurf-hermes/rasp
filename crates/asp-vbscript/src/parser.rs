@@ -29,7 +29,7 @@ use asp_core::{AspError, AspResult};
 
 /// One evaluated expression value. VBScript has only Variant; the
 /// language crates keep the useful subset with real `Empty` semantics.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Variant {
     /// Uninitialised; converts to "" when written, 0 in arithmetic.
     Empty,
@@ -39,6 +39,9 @@ pub enum Variant {
     /// Booleans are stored as integers internally (0 / ~0).
     Bool(bool),
     Str(String),
+    /// A live native object (`Server.CreateObject`); clone shares the
+    /// same object (reference semantics, like COM).
+    Native(std::rc::Rc<crate::native::NativeObj>),
     /// A value assigned through an object reference (`Set`); opaque.
     ObjectRef(String),
     /// Date/time value (`Date`, `CDate`, date arithmetic) with
@@ -48,6 +51,26 @@ pub enum Variant {
     /// Array value: fixed-size (`Dim a(3)`) or dynamic (`a = Array(...)`).
     /// One dimension (indexes 0..=size); multi-dimensional arrives in M3.
     Arr(Vec<Variant>),
+}
+
+/// Equality by value; native objects compare by shared identity
+/// (two `Rc` handles to the same object are equal, like COM).
+impl PartialEq for Variant {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Empty, Self::Empty) => true,
+            (Self::Null, Self::Null) => true,
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a == b,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Str(a), Self::Str(b)) => a == b,
+            (Self::Native(a), Self::Native(b)) => std::rc::Rc::ptr_eq(a, b),
+            (Self::ObjectRef(a), Self::ObjectRef(b)) => a == b,
+            (Self::Date(a), Self::Date(b)) => a == b,
+            (Self::Arr(a), Self::Arr(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl Variant {
@@ -61,6 +84,10 @@ impl Variant {
             Variant::Bool(true) => "True".to_string(),
             Variant::Bool(false) => "False".to_string(),
             Variant::Str(s) => s.clone(),
+            Variant::Native(obj) => match &*obj.state.borrow() {
+                crate::native::NativeState::Dictionary(_) => "Dictionary".to_string(),
+                crate::native::NativeState::FileSystem => "FileSystemObject".to_string(),
+            },
             Variant::ObjectRef(name) => name.clone(),
             Variant::Date(d) => crate::vb_datetime::render(*d),
             Variant::Arr(_) => {
@@ -93,6 +120,10 @@ impl Variant {
             Variant::ObjectRef(_) => Err(date_number_error(
                 line,
                 "type mismatch: object reference in arithmetic",
+            )),
+            Variant::Native(_) => Err(date_number_error(
+                line,
+                "type mismatch: object in arithmetic",
             )),
             Variant::Arr(_) => Err(date_number_error(
                 line,
@@ -181,6 +212,18 @@ pub enum Stmt {
     ApplicationLock,
     /// `Application.UnLock`.
     ApplicationUnlock,
+    /// `Set name = expr` — binds an object reference (native object or
+    /// another variable's object value).
+    SetAssign { name: String, value: Expr },
+    /// A member-call expression executed for effect (`d.Add "k", "v"`):
+    /// value discarded.
+    ExprStatement(Box<Expr>),
+    /// `Server.Execute "page"` — render the page inline; output merges
+    /// into the current buffer.
+    ServerExecute(String),
+    /// `Server.Transfer "page"` — replace THIS page's output with the
+    /// target page's render and stop.
+    ServerTransfer(String),
     /// Any `Response.verb [args...]` call statement, including
     /// property assignments (`Response.Status = "404 Not Found"`).
     ResponseCall { verb: String, args: Vec<Expr> },
@@ -266,6 +309,28 @@ pub enum Expr {
     },
     /// `Request.ServerVariables("NAME")` read.
     RequestServerVariable(String),
+    /// `Server.CreateObject("ProgID")`; evaluated against the registry.
+    NativeNew(String),
+    /// `Server.MapPath("path")` — host string mapping.
+    ServerMapPath(String),
+    /// `obj.Method(args)` on a native object (evaluated through the
+    /// host/registry dispatch).
+    NativeCall {
+        obj: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
+    },
+    /// `obj.Property` read on a native object (`Count`).
+    NativeProp {
+        obj: Box<Expr>,
+        prop: String,
+    },
+    /// `dict("key")` / `dict.Item("key")` — the object's default
+    /// property read.
+    NativeDefault {
+        obj: Box<Expr>,
+        key: Box<Expr>,
+    },
     /// Unary minus applied by the parser.
     Neg(Box<Expr>),
     Not(Box<Expr>),
@@ -399,6 +464,8 @@ impl P {
                 }
             }
             Tok::Name(name) if name == "call" => self.parse_call_keyword(),
+            Tok::Name(name) if name == "set" => self.parse_set_assign(),
+            Tok::Name(name) if name == "server" => self.parse_server_stmt(),
             Tok::Name(name) if is_reserved(&name) => Err(self.error(format!(
                 "VBScript feature '{name}' is not supported in Milestone 2"
             ))),
@@ -421,11 +488,9 @@ impl P {
                         self.parse_name_then_paren(name)
                     }
                     Tok::Sym(op) if op == "." => {
-                        // SomeObject.member — unsupported outside Response/Request.
-                        let member = self.peek_member_name()?;
-                        Err(self.error(format!(
-                            "object '{name}.{member}' is not supported in Milestone 2"
-                        )))
+                        // Object-member statement: `obj.Method args` or
+                        // `obj.Method(arg, ...)` on a CreateObject instance.
+                        self.parse_member_call_stmt(name)
                     }
                     Tok::LineEnd => {
                         // Bare name alone on a line: a zero-argument
@@ -758,6 +823,14 @@ impl P {
                 }
             }
             Tok::Name(name) if name == "call" => self.parse_call_keyword(),
+            Tok::Name(name) if name == "set" => {
+                let stmt = self.parse_set_assign()?;
+                Ok(stmt)
+            }
+            Tok::Name(name) if name == "server" => {
+                let stmt = self.parse_server_stmt()?;
+                Ok(stmt)
+            }
             Tok::Name(name) if name == "sub" || name == "function" => {
                 let is_function = name == "function";
                 self.parse_proc(is_function)
@@ -780,6 +853,9 @@ impl P {
                         index: None,
                         value,
                     });
+                }
+                if matches!(self.peek(), Tok::Sym(s) if s == ".") {
+                    return self.parse_member_call_stmt(name);
                 }
                 Err(self.error(format!("expected '=' after variable '{name}'")))
             }
@@ -1065,6 +1141,137 @@ impl P {
     /// - `Response.Status = expr`, `Response.ContentType = expr`, etc.
     /// - `Response.Cookies("name") = expr` (sub-attributes like
     ///   `Response.Cookies("x").Expires` land with full cookie support).
+    ///
+    /// `name.Method args...` in statement position: builds the member
+    /// chain expression and wraps it for execution (value discarded).
+    /// VBScript statement-position members pass args WITHOUT parens
+    /// (`d.Add "k", "v"`), which `parse_member_chain` cannot eat, so
+    /// parse them space-separated here.
+    fn parse_member_call_stmt(&mut self, base: String) -> AspResult<Stmt> {
+        // Walk `.member` steps, collecting a dotted path on a fake root
+        // variable expression, then optional args.
+        let mut path = vec![base];
+        loop {
+            if matches!(self.peek(), Tok::Sym(s) if s == ".") {
+                let member = self.peek_member_name()?;
+                path.push(member);
+                continue;
+            }
+            break;
+        }
+        // Optional parened or bare args after the last member.
+        let mut args: Vec<Expr> = Vec::new();
+        if matches!(self.peek(), Tok::Sym(s) if s == "(") {
+            self.advance();
+            if !matches!(self.peek(), Tok::Sym(s) if s == ")") {
+                args.push(self.parse_expr()?);
+                while matches!(self.peek(), Tok::Sym(s) if s == ",") {
+                    self.advance();
+                    args.push(self.parse_expr()?);
+                }
+            }
+            self.expect_sym(")")?;
+        } else if matches!(
+            self.peek(),
+            Tok::Name(_) | Tok::Int(_) | Tok::Float(_) | Tok::Str(_)
+        ) {
+            // Space-separated VBScript statement args (one or more).
+            args.push(self.parse_expr()?);
+            while matches!(self.peek(), Tok::Sym(s) if s == ",") {
+                self.advance();
+                args.push(self.parse_expr()?);
+            }
+        }
+        if matches!(self.peek(), Tok::LineEnd) {
+            self.advance();
+        }
+        // Build: Expr::Variable(first), then one NativeCall per dotted
+        // step, with the parsed args attached to the LAST step.
+        let stmts_count = path.len();
+        let mut it = path.into_iter();
+        let first = it.next().unwrap_or_default();
+        let mut expr = Expr::Variable(first);
+        for (i, member) in it.enumerate() {
+            let last = i + 2 == stmts_count;
+            expr = Expr::NativeCall {
+                obj: Box::new(expr),
+                method: member,
+                args: if last { args.clone() } else { Vec::new() },
+            };
+        }
+        Ok(Stmt::ExprStatement(Box::new(expr)))
+    }
+
+    /// `Server.Execute "page"` / `Server.Transfer "page"` statements.
+    /// Exec merges target output inline; Transfer replaces this page's
+    /// output and stops.
+    fn parse_server_stmt(&mut self) -> AspResult<Stmt> {
+        self.advance(); // server
+        self.expect_sym(".")?;
+        let member = match self.peek().clone() {
+            Tok::Name(m) => {
+                self.advance();
+                m
+            }
+            other => {
+                return Err(self.error(format!(
+                    "expected a Server member, found {}",
+                    other.describe()
+                )));
+            }
+        };
+        if member.eq_ignore_ascii_case("execute") || member.eq_ignore_ascii_case("transfer") {
+            let arg = if matches!(self.peek(), Tok::Sym(s) if s == "(") {
+                self.advance();
+                let p = self.parse_expr()?;
+                self.expect_sym(")")?;
+                p
+            } else {
+                self.parse_expr()?
+            };
+            let path = match arg {
+                Expr::Literal(Variant::Str(s)) => s,
+                _ => {
+                    return Err(self.error(format!("Server.{member} requires a string page path")));
+                }
+            };
+            if matches!(self.peek(), Tok::LineEnd) {
+                self.advance();
+            }
+            return Ok(if member.eq_ignore_ascii_case("execute") {
+                Stmt::ServerExecute(path)
+            } else {
+                Stmt::ServerTransfer(path)
+            });
+        }
+        Err(self.error(format!(
+            "'Server.{member}' is not supported as a statement in Milestone 5"
+        )))
+    }
+
+    /// `Set name = expr`.
+    fn parse_set_assign(&mut self) -> AspResult<Stmt> {
+        self.advance(); // set
+        let name = match self.peek().clone() {
+            Tok::Name(n) => {
+                self.advance();
+                n
+            }
+            other => {
+                return Err(self.error(format!(
+                    "expected a variable name after Set, found {}",
+                    other.describe()
+                )));
+            }
+        };
+        self.expect_sym("=")?;
+        let value = self.parse_expr()?;
+        if matches!(self.peek(), Tok::LineEnd) {
+            self.advance();
+        }
+        Ok(Stmt::SetAssign { name, value })
+    }
+
     fn parse_response_stmt(&mut self) -> AspResult<Stmt> {
         self.advance(); // response
         self.expect_sym(".")?;
@@ -1355,6 +1562,96 @@ impl P {
         }
     }
 
+    /// Member access chain after a base expression: `.Method(args)`,
+    /// `.Property`, or `(key)` for the object's default property (only
+    /// after a `.member` step — bare names mean arrays/calls). Also folds
+    /// `dict.Item("k")` into a default-property read.
+    fn parse_member_chain(&mut self, base: Expr) -> AspResult<Expr> {
+        let mut base = base;
+        // A `(` postfix may only fold into NativeDefault once the base
+        // went through a member step (`d.Item("k")`, `x.Foo("k")`); bare
+        // `d("k")` keeps Builtin/array semantics handled by the caller.
+        let mut membered = false;
+        loop {
+            match self.peek() {
+                Tok::Sym(s) if s == "." => {
+                    self.advance();
+                    let member = match self.peek().clone() {
+                        Tok::Name(m) => {
+                            self.advance();
+                            m
+                        }
+                        other => {
+                            return Err(self.error(format!(
+                                "expected a member name, found {}",
+                                other.describe()
+                            )));
+                        }
+                    };
+                    let args = if matches!(self.peek(), Tok::Sym(s) if s == "(") {
+                        self.advance();
+                        let mut parsed = Vec::new();
+                        if !matches!(self.peek(), Tok::Sym(s) if s == ")") {
+                            parsed.push(self.parse_expr()?);
+                            while matches!(self.peek(), Tok::Sym(s) if s == ",") {
+                                self.advance();
+                                parsed.push(self.parse_expr()?);
+                            }
+                        }
+                        self.expect_sym(")")?;
+                        Some(parsed)
+                    } else {
+                        None
+                    };
+                    base = match args {
+                        Some(mut a) if a.len() == 1 && member.eq_ignore_ascii_case("item") => {
+                            membered = true;
+                            Expr::NativeDefault {
+                                obj: Box::new(base),
+                                key: Box::new(a.remove(0)),
+                            }
+                        }
+                        Some(a) => Expr::NativeCall {
+                            obj: Box::new(base),
+                            method: member,
+                            args: a,
+                        },
+                        None => {
+                            membered = true;
+                            Expr::NativeProp {
+                                obj: Box::new(base),
+                                prop: member,
+                            }
+                        }
+                    };
+                }
+                Tok::Sym(s) if s == "(" => {
+                    self.advance();
+                    let keyexpr = self.parse_expr()?;
+                    self.expect_sym(")")?;
+                    if membered {
+                        base = Expr::NativeDefault {
+                            obj: Box::new(base),
+                            key: Box::new(keyexpr),
+                        };
+                    } else {
+                        // Bare `d("k")`: preserve old behaviour. If base is a
+                        // Builtin/Variable it was already returned properly by
+                        // the caller — but we get here only when parse_primary
+                        // produced Variable/Builtin and `(` follows directly.
+                        // Keep the exact old shape: re-emit the original
+                        // call/index form.
+                        return Err(self.error(
+                            "default-property access needs a member step (use d.Item(\"k\"))",
+                        ));
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(base)
+    }
+
     fn parse_primary(&mut self) -> AspResult<Expr> {
         match self.peek().clone() {
             Tok::Int(i) => {
@@ -1471,6 +1768,44 @@ impl P {
                     ))),
                 }
             }
+            Tok::Name(n) if n == "server" => {
+                self.advance();
+                self.expect_sym(".")?;
+                let member = match self.peek().clone() {
+                    Tok::Name(m) => {
+                        self.advance();
+                        m
+                    }
+                    other => {
+                        return Err(self.error(format!(
+                            "expected a Server member, found {}",
+                            other.describe()
+                        )));
+                    }
+                };
+                if member.eq_ignore_ascii_case("mappath") {
+                    self.expect_sym("(")?;
+                    let path = match self.parse_expr()? {
+                        Expr::Literal(Variant::Str(s)) => s,
+                        _ => return Err(self.error("MapPath requires a string path")),
+                    };
+                    self.expect_sym(")")?;
+                    return Ok(Expr::ServerMapPath(path));
+                }
+                // `Server.CreateObject("ProgID")`
+                if member.eq_ignore_ascii_case("createobject") {
+                    self.expect_sym("(")?;
+                    let progid = match self.parse_expr()? {
+                        Expr::Literal(Variant::Str(s)) => s,
+                        _ => {
+                            return Err(self.error("CreateObject requires a string ProgID"));
+                        }
+                    };
+                    self.expect_sym(")")?;
+                    return Ok(Expr::NativeNew(progid));
+                }
+                Err(self.error(format!("'Server.{member}' is not supported in Milestone 5")))
+            }
             Tok::Name(n) if n == "request" => {
                 self.advance();
                 self.expect_sym(".")?;
@@ -1509,7 +1844,7 @@ impl P {
             }
             Tok::Name(n) if !is_reserved(&n) => {
                 self.advance();
-                if matches!(self.peek(), Tok::Sym(s) if s == "(") {
+                let base = if matches!(self.peek(), Tok::Sym(s) if s == "(") {
                     self.advance();
                     let mut args = Vec::new();
                     if !matches!(self.peek(), Tok::Sym(s) if s == ")") {
@@ -1521,9 +1856,11 @@ impl P {
                     }
                     self.expect_sym(")")?;
                     let line = self.current_line();
-                    return Ok(Expr::Builtin(n, args, line));
-                }
-                Ok(Expr::Variable(n))
+                    Expr::Builtin(n, args, line)
+                } else {
+                    Expr::Variable(n)
+                };
+                self.parse_member_chain(base)
             }
             Tok::Sym(s) if s == "(" => {
                 self.advance();

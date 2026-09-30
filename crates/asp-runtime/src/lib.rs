@@ -6,9 +6,11 @@
 //! M4 adds session/application state ([`session`]) and `global.asa`
 //! event firing around the render.
 
+pub mod host;
 pub mod session;
 
 pub use asp_vbscript::StateStores;
+pub use host::RuntimeHost;
 pub use session::{GlobalAsa, SESSION_COOKIE_NAME, SessionManager, fire_global_asa_events};
 
 use asp_core::error::Diagnostic;
@@ -249,6 +251,7 @@ fn fresh_env(base: &ExecEnv) -> ExecEnv {
     env.application = base.application.clone();
     env.request_data = base.request_data.clone();
     env.server_variables = base.server_variables.clone();
+    env.host = base.host.clone();
     env
 }
 
@@ -319,10 +322,17 @@ pub fn render_page_stores(
 ) -> AspResult<(RenderOutput, StateStores)> {
     let mut seen = Vec::new();
     let assembled = assemble(app, root_relative, &mut seen)?;
+    let host = RuntimeHost::new(
+        app.clone(),
+        stores.clone(),
+        server_variables.clone(),
+        request_data.clone(),
+    );
     let base = ExecEnv::new()
         .with_request_data(request_data)
         .with_server_variables(server_variables)
-        .with_state(stores.clone());
+        .with_state(stores.clone())
+        .with_host(host as std::rc::Rc<dyn asp_vbscript::NativeHost>);
     let out = render_assembled(&assembled, &base)?;
     let exit_stores = StateStores {
         session: out.session.clone().unwrap_or_default(),
@@ -492,5 +502,136 @@ mod tests {
             Ok(()) => assert_eq!(env.response.body(), "v=4"),
             Err(e) => panic!("exec failed: {e}"),
         }
+    }
+
+    // ---- Milestone 5: native objects, MapPath, Execute/Transfer ----
+
+    #[test]
+    fn fso_read_write_delete_inside_root() {
+        let root = build_app("fso1");
+        fs::write(root.join("p.asp"),
+            "<% Set f = Server.CreateObject(\"Scripting.FileSystemObject\")\n f.CreateTextFile \"out/log.txt\", \"hello\"\n Response.Write f.ReadTextFile(\"out/log.txt\")\n f.DeleteFile \"out/log.txt\"\n Response.Write \":\" & f.FileExists(\"out/log.txt\") %>").unwrap();
+        let app = AppRoot::new(&root);
+        let (out, _) = crate::render_page_stores(
+            &app,
+            "p.asp",
+            HashMap::new(),
+            HashMap::new(),
+            &StateStores::default(),
+        )
+        .unwrap();
+        assert_eq!(out.body, "hello:False");
+    }
+
+    #[test]
+    fn fso_rejects_traversal_outside_root() {
+        let root = build_app("fso2");
+        fs::write(root.join("p.asp"),
+            "<% Set f = Server.CreateObject(\"Scripting.FileSystemObject\")\n Response.Write f.FileExists(\"../secret.txt\") %>").unwrap();
+        let app = AppRoot::new(&root);
+        let err = crate::render_page_stores(
+            &app,
+            "p.asp",
+            HashMap::new(),
+            HashMap::new(),
+            &StateStores::default(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("application root"), "{err}");
+    }
+
+    #[test]
+    fn fso_rejects_symlink_escape() {
+        let root = build_app("fso3");
+        let outside = std::env::temp_dir().join(format!("rasp-outside-{}", std::process::id()));
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "top secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("leak")).unwrap();
+        fs::write(root.join("p.asp"),
+            "<% Set f = Server.CreateObject(\"Scripting.FileSystemObject\")\n Response.Write f.ReadTextFile(\"leak/secret.txt\") %>").unwrap();
+        let app = AppRoot::new(&root);
+        let err = crate::render_page_stores(
+            &app,
+            "p.asp",
+            HashMap::new(),
+            HashMap::new(),
+            &StateStores::default(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("application root"), "{err}");
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn server_mappath_maps_inside_root() {
+        let root = build_app("mp");
+        fs::write(root.join("p.asp"), "<%= Server.MapPath(\"data/x.txt\") %>").unwrap();
+        let app = AppRoot::new(&root);
+        let (out, _) = crate::render_page_stores(
+            &app,
+            "p.asp",
+            HashMap::new(),
+            HashMap::new(),
+            &StateStores::default(),
+        )
+        .unwrap();
+        assert!(out.body.ends_with("data/x.txt"), "{}", out.body);
+    }
+
+    #[test]
+    fn server_execute_merges_output() {
+        let root = build_app("exec");
+        fs::write(root.join("sub.asp"), "SUB").unwrap();
+        fs::write(root.join("p.asp"), "A<% Server.Execute \"sub.asp\" %>B").unwrap();
+        let app = AppRoot::new(&root);
+        let (out, _) = crate::render_page_stores(
+            &app,
+            "p.asp",
+            HashMap::new(),
+            HashMap::new(),
+            &StateStores::default(),
+        )
+        .unwrap();
+        assert_eq!(out.body, "ASUBB");
+    }
+
+    #[test]
+    fn server_transfer_replaces_output() {
+        let root = build_app("transfer");
+        fs::write(root.join("target.asp"), "TARGET").unwrap();
+        fs::write(root.join("p.asp"), "A<% Server.Transfer \"target.asp\" %>B").unwrap();
+        let app = AppRoot::new(&root);
+        let (out, _) = crate::render_page_stores(
+            &app,
+            "p.asp",
+            HashMap::new(),
+            HashMap::new(),
+            &StateStores::default(),
+        )
+        .unwrap();
+        assert_eq!(out.body, "TARGET");
+    }
+
+    #[test]
+    fn create_object_unknows_are_clear() {
+        let root = build_app("objerr");
+        fs::write(
+            root.join("p.asp"),
+            "<% Set x = Server.CreateObject(\"ADODB.Connection\") %>",
+        )
+        .unwrap();
+        let app = AppRoot::new(&root);
+        let err = crate::render_page_stores(
+            &app,
+            "p.asp",
+            HashMap::new(),
+            HashMap::new(),
+            &StateStores::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not available"), "{msg}");
+        assert!(msg.contains("Scripting.Dictionary"), "{msg}");
     }
 }

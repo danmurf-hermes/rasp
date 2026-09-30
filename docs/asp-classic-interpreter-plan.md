@@ -207,7 +207,7 @@ Any status change should be accompanied by a short note in the relevant section 
 | Session state | Built | `Session` named values + `Contents`, `SessionID`, `Timeout`, `Abandon`; `ASPSESSIONID` cookie maps to an in-process store with idle expiry (Timeout minutes, default 20). Signed cookie values and pluggable remote stores deferred. |
 | Application state | Built | `Application` named values + `Contents`, `Lock`/`UnLock`; per-process state. Lock is a flag until concurrent request handling exists. |
 | `global.asa` support | Built | `Application_OnStart` (once per process) and `Session_OnStart` (per new session) fire before the page; `Session_OnEnd`/`Application_OnEnd` are parsed but not fired (in-process sessions end with the process). |
-| Filesystem object mapping | Not started | Map `Scripting.FileSystemObject` to a sandboxed Rust implementation. |
+| Filesystem object mapping | Partial | `Server.CreateObject` + native registry; sandboxed `Scripting.FileSystemObject` (existence/reads/creates/deletes/listing, traversal and symlink tests) and `Scripting.Dictionary`; full TextStream/Folder object model still to come. |
 | Database/ADO support | Not started | Start with a small SQL adapter before trying broad ADO compatibility. |
 | JScript support | Not started | Optional; prioritize VBScript first. |
 | HTTP server integration | Built | `tiny_http`-backed sequential server maps GET/POST URLs to `.asp` pages, applies the default document, decodes query/form/cookie data, and returns rendered bodies with 404/500 handling. |
@@ -605,34 +605,39 @@ Deferred:
 
 ### 7.8 Native COM mappings
 
-**Status:** Not started
+**Status:** Partial — `FileSystemObject` and `Dictionary` built (M5)
 
 Generic COM cannot be recreated cross-platform. Instead, define a native object registry.
 
 Priority order:
 
-1. `Scripting.FileSystemObject`
-2. `ADODB.Connection` and `ADODB.Recordset`
-3. `Scripting.Dictionary`
+1. `Scripting.FileSystemObject` **Built (M5)** — simplified: file verbs
+   (`FileExists`, `ReadTextFile`, `CreateTextFile`, `AppendTextFile`,
+   `DeleteFile`, `CreateFolder`, `ListFolder`, …) go through the
+   sandboxed host instead of the `Folder`/`TextStream` object dance.
+2. `ADODB.Connection` and `ADODB.Recordset` (Milestone 6).
+3. `Scripting.Dictionary` **Built (M5)** — `Add`, `Exists`, `Items`,
+   `Keys`, `Count`, `Remove`, `RemoveAll`, default-index reads, COM-style
+   reference semantics, real VBScript error strings.
 4. `MSXML2.DOMDocument`
 5. `CDO.Message` or similar email components
 6. Common third-party components discovered in real applications
 
 Recommended implementation:
 
-- A `ProgID` registry maps COM identifiers to native Rust implementations.
-- Native objects implement the same runtime object interface as script-defined classes.
-- Unsupported ProgIDs return a clear configuration error.
-- The registry can be extended without changing the language engine.
-- Dangerous capabilities are disabled by default.
+- A `ProgID` registry maps COM identifiers to native Rust implementations. **Built (M5)** — the registry rejects unknown ProgIDs with a clear error listing what is available.
+- Native objects implement the same runtime object interface as script-defined classes. **Built (M5)** — `Variant::Native` values with member calls (`obj.Method args`, paren forms) and properties.
+- Unsupported ProgIDs return a clear configuration error. **Built (M5).**
+- The registry can be extended without changing the language engine. **Built (M5)** — new ProgIDs are one enum arm + one dispatch arm.
+- Dangerous capabilities are disabled by default. **Built (M5)** — the FSO cannot leave the application root.
 
-`Scripting.FileSystemObject` should honor the ASP application root and an optional allowlist. It must not expose arbitrary host filesystem paths unless explicitly configured.
+`Scripting.FileSystemObject` should honor the ASP application root and an optional allowlist. It must not expose arbitrary host filesystem paths unless explicitly configured. **Built (M5)** — every path is confined to the root: traversal (`..`), absolute paths, backslashes, and symlinks resolving outside the root are rejected; deleted/missing files report through `FileExists`/`FolderExists` as `False` rather than errors. An allowlist can be layered on the host later.
 
 Acceptance criteria:
 
-- Known objects can be created through `Server.CreateObject`.
-- Unsupported objects produce a clear error.
-- File operations are tested against path traversal and symlink escapes.
+- Known objects can be created through `Server.CreateObject`. **Met.**
+- Unsupported objects produce a clear error. **Met.**
+- File operations are tested against path traversal and symlink escapes. **Met** (`fso_rejects_traversal_outside_root`, `fso_rejects_symlink_escape`).
 
 ---
 
@@ -918,19 +923,26 @@ Definition of done:
 
 ### Milestone 5 — Filesystem and object mappings
 
-**Status:** Not started
+**Status:** Built
 
 Deliverables:
 
-- Native object interface.
-- `Scripting.FileSystemObject`.
-- `Scripting.Dictionary`.
-- Path sandbox and traversal tests.
-- `Server.MapPath`, `Execute`, and `Transfer`.
+- Native object interface. **Built** — ProgID registry,
+  `Server.CreateObject("ProgID")`, member calls/properties on native
+  objects, `Set` assignments with COM-style reference semantics.
+- `Scripting.FileSystemObject`. **Built** — sandboxed simplified file
+  verbs through the runtime host (no TextStream object yet).
+- `Scripting.Dictionary`. **Built** — full verb set plus default-index
+  reads and `Count`/`Keys`/`Items` properties.
+- Path sandbox and traversal tests. **Built** — traversal, absolute
+  paths, backslashes, and symlink escapes rejected; tested.
+- `Server.MapPath`, `Execute`, and `Transfer`. **Built** — MapPath
+  normalises inside the root, Execute merges output, Transfer replaces
+  output and stops.
 
 Definition of done:
 
-- File-backed ASP examples run safely inside the configured app root.
+- File-backed ASP examples run safely inside the configured app root. **Met** — `examples/hello-app/dict.asp` and `files.asp` run (goldens), Execute/Transfer goldens pass.
 
 ### Milestone 6 — Database support
 
@@ -1034,10 +1046,8 @@ This checklist applies before every pull request is marked ready for review.
 
 ## 12. Immediate next steps
 
-1. Milestone 5 — filesystem and object mappings: native object
-   interface (`Server.CreateObject` with a ProgID registry,
-   `Scripting.FileSystemObject` sandboxed per §7.8, then
-   `Scripting.Dictionary`), plus `Server.MapPath`/`Execute`/`Transfer`.
-2. Finish the variant-semantics workstream: multi-dimensional arrays, `Byte`/binary data (`Request.BinaryRead`/`Response.BinaryWrite`), and a documented coercion table.
-3. Session hardening follow-ups (small, do with M5 or as a standalone PR): signed session cookie values (HMAC with a per-process key), concurrent request handling so `Application.Lock` becomes real exclusion, and firing `Session_OnEnd`/`Application_OnEnd` from the expiry/abort paths.
-4. Keep `AGENTS.md` in step with new conventions as they emerge (note: the M2 executor's normalization pass over deferred delimiters is the load-bearing architecture for cross-block and nested constructs).
+1. Milestone 6 — database support: minimal ADO-compatible interface, SQLite adapter first (`ADODB.Connection`/`Recordset` mapping; the ProgID registry from M5 makes this an additive change).
+2. Session hardening follow-ups (small, do with M6 or as a standalone PR): signed session cookie values (HMAC with a per-process key), concurrent request handling so `Application.Lock` becomes real exclusion, and firing `Session_OnEnd`/`Application_OnEnd` from the expiry/abort paths.
+3. FSO completeness follow-up (as real apps need it): the `Folder`/`File`/`TextStream` object model with `ForReading`/`ForWriting`/`ForAppending` modes, plus `.Drive`-free path helpers.
+4. Finish the variant-semantics workstream: multi-dimensional arrays, `Byte`/binary data (`Request.BinaryRead`/`Response.BinaryWrite`), and a documented coercion table.
+5. Keep `AGENTS.md` in step with new conventions as they emerge (note: the M2 executor's normalization pass over deferred delimiters is the load-bearing architecture for cross-block and nested constructs).
