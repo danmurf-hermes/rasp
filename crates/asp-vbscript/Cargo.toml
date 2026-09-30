@@ -9,3 +9,4 @@ description = "VBScript lexer, parser, and evaluator for RASP."
 
 [dependencies]
 asp-core = { path = "../asp-core" }
+chrono.workspace = true

@@ -11,6 +11,9 @@ repository = "https://github.com/danmurf/rasp"
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
+tiny_http = "0.12"
+percent-encoding = "2"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 [profile.release]
 lto = true
