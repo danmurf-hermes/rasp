@@ -169,7 +169,7 @@ pub enum Expr {
     Binary(String, Box<Expr>, Box<Expr>),
     /// Any builtin name call that is not an ASP intrinsic object.
     Builtin(String, Vec<Expr>, usize),
-    /// A method call on the Request object for value-returning use.
+    /// A method call on the Response object for value-returning use.
     ResponseValue(String),
 }
 
@@ -834,6 +834,12 @@ impl P {
             Tok::Name(n) if n == "true" => {
                 self.advance();
                 Ok(Expr::Literal(Variant::Bool(true)))
+            }
+            Tok::Name(n) if n == "response" => {
+                // Expression-position Response calls are beyond M1's
+                // grammar; statement-position `Response.<verb>` is parsed
+                // by `parse_response_stmt`.
+                Err(self.error("Response in expression position is not supported in Milestone 1"))
             }
             Tok::Name(n) if n == "false" => {
                 self.advance();

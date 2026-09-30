@@ -184,6 +184,12 @@ End If";
     }
 
     #[test]
+    fn response_in_expression_position_is_a_clear_error() {
+        let err = parse_block("Dim n: n = Response.Write", 1).unwrap_err();
+        assert!(matches!(err, AspError::Syntax(d) if d.message.contains("expression position")));
+    }
+
+    #[test]
     fn division_by_zero_is_runtime_error() {
         let stmts = parse_block("Response.Write 1 / 0", 1).unwrap();
         let mut env = ExecEnv::new();

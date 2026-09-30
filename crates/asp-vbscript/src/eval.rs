@@ -147,7 +147,6 @@ pub fn exec_block_loops(stmts: &[Stmt], env: &mut ExecEnv) -> AspResult<()> {
                             i,
                             stmts,
                             env,
-                            &mut stack,
                         )?;
                         // exec_for_from leaves the stack tidy: the
                         // frames it pushed were nested inside and have
@@ -179,10 +178,6 @@ pub fn exec_block_loops(stmts: &[Stmt], env: &mut ExecEnv) -> AspResult<()> {
                                 "Do loop cannot have both a leading and a trailing condition",
                             ));
                         }
-                        if trailing.is_some() && pre {
-                            // `Do While c ... Loop While c2`: leading was
-                            // checked; trailing checked after each run.
-                        }
                         let pre_now = if trailing.is_some() { false } else { pre };
                         let while_now = match (&stmts[i], trailing.is_some()) {
                             (Stmt::DoClose { while_form, .. }, true) => *while_form,
@@ -196,7 +191,6 @@ pub fn exec_block_loops(stmts: &[Stmt], env: &mut ExecEnv) -> AspResult<()> {
                             i,
                             stmts,
                             env,
-                            &mut stack,
                         )?;
                         i += 1;
                     }
@@ -230,7 +224,6 @@ fn exec_for_from(
     next_idx: usize,
     stmts: &[Stmt],
     env: &mut ExecEnv,
-    _stack: &mut Vec<LoopFrame>,
 ) -> AspResult<()> {
     let start_v = eval_expr(start, env)?;
     let end_v = eval_expr(end, env)?;
@@ -275,7 +268,6 @@ fn exec_do_from(
     loop_idx: usize,
     stmts: &[Stmt],
     env: &mut ExecEnv,
-    _stack: &mut Vec<LoopFrame>,
 ) -> AspResult<()> {
     let body = &stmts[body_range(opener_idx, loop_idx)];
     fn cond_holds(cond: Option<&Expr>, while_form: bool, env: &mut ExecEnv) -> AspResult<bool> {
@@ -404,8 +396,8 @@ fn exec_response_call(verb: &str, arg: Option<&Expr>, env: &mut ExecEnv) -> AspR
         }
         "buffer" => {
             // M1 always buffers; accept and ignore the property value.
-            if let Some(_e) = arg {
-                let _ = eval_expr(_e, env)?;
+            if let Some(e) = arg {
+                let _ = eval_expr(e, env)?;
             }
             Ok(())
         }

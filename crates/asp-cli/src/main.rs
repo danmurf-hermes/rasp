@@ -155,14 +155,9 @@ fn check(root: &std::path::Path) -> Result<usize, AspError> {
             if name.to_ascii_lowercase().ends_with(".asp") {
                 let source = std::fs::read_to_string(&path)
                     .map_err(|e| AspError::Io(format!("cannot read {}: {e}", path.display())))?;
-                if let Err(err) = asp_core::Page::parse(&source) {
-                    broken += 1;
-                    println!("{}: {err}", path.display());
-                    continue;
-                }
-                // Parse every <% %> block body with the language engine.
                 match asp_core::Page::parse(&source) {
                     Ok(page) => {
+                        // Parse every <% %> block body with the language engine.
                         for block in &page.blocks {
                             if let asp_core::parser::Block::Script { body } = block
                                 && let Err(err) = asp_vbscript::parse_block(body, 1)
