@@ -1,0 +1,14 @@
+#!/bin/sh
+# RASP pre-commit gate: fmt -> clippy -> tests.
+# Enable with:  git config core.hooksPath .githooks
+
+set -e
+
+if ! cargo fmt --all --check; then
+    echo "rasp: formatting check failed; run 'cargo fmt --all' and re-stage" >&2
+    exit 1
+fi
+
+cargo clippy --all-targets -- -D warnings
+
+cargo test --all

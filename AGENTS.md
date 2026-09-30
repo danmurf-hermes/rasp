@@ -4,6 +4,9 @@ Classic ASP interpreter in Rust. Keep changes small; one milestone per PR.
 
 ## Gates (run before every push, in order)
 
+Commits run them automatically via the pre-commit hook — enable once with
+`git config core.hooksPath .githooks`. To run them by hand:
+
 ```bash
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings

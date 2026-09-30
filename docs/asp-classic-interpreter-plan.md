@@ -195,7 +195,7 @@ Any status change should be accompanied by a short note in the relevant section 
 | Area | Status | Current notes |
 |---|---|---|
 | Project scaffolding | Built | Cargo workspace, five focused crates, placeholder `rasp` CLI (`version` works), README quick start. |
-| Cargo workspace and CI | Built | GitHub Actions quality job (fmt, clippy, test on Ubuntu and macOS) plus a Docker build/run smoke test. `AGENTS.md` records the gate commands and architecture invariants for future agents. |
+| Cargo workspace and CI | Built | GitHub Actions quality job (fmt, clippy, test on Ubuntu and macOS) plus a Docker build/run smoke test. Pre-commit hook in `.githooks/` (enable via `git config core.hooksPath .githooks`) runs the same gates before every commit. `AGENTS.md` records the conventions for future agents. |
 | ASP page parser | Built | Text, `<% %>`, `<%= %>`, `<%@ Language %>`, and `<!-- #include -->` directives parsed per page; ordinary comments pass through. |
 | Include resolution | Built | `file` resolves against the containing page's directory, `virtual` against the app root; path-confinement checks, 32-depth cycle detection. |
 | VBScript lexer | Built | Case-insensitive keywords, strings with `""` escapes, `'` comments, `_` continuations, hex/octal literals, statement line-end tracking. |
