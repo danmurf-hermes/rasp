@@ -9,3 +9,5 @@ description = "HTTP server and request-to-response integration for RASP."
 
 [dependencies]
 asp-core = { path = "../asp-core" }
+asp-runtime = { path = "../asp-runtime" }
+tiny_http.workspace = true

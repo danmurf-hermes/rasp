@@ -13,4 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 asp-core = { path = "../asp-core" }
+asp-runtime = { path = "../asp-runtime" }
+asp-vbscript = { path = "../asp-vbscript" }
+asp-http = { path = "../asp-http" }
 clap.workspace = true

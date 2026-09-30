@@ -1,0 +1,1 @@
+<div class="footer"><% Response.Write "rendered by RASP" %></div>

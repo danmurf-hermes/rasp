@@ -196,24 +196,24 @@ Any status change should be accompanied by a short note in the relevant section 
 |---|---|---|
 | Project scaffolding | Built | Cargo workspace, five focused crates, placeholder `rasp` CLI (`version` works), README quick start. |
 | Cargo workspace and CI | Built | GitHub Actions quality job (fmt, clippy, test on Ubuntu and macOS) plus a Docker build/run smoke test. |
-| ASP page parser | Not started | Parse text, `<% %>`, `<%= %>`, and script language declarations. |
-| Include resolution | Not started | Implement `file` and `virtual`; protect against path traversal and cycles. |
-| VBScript lexer | Not started | Handle line-based syntax, case insensitivity, comments, strings, and line continuations. |
-| VBScript parser and AST | Not started | Start with expressions and core statements before classes. |
-| VBScript evaluator | Not started | Start with a deterministic, testable interpreter. |
+| ASP page parser | Built | Text, `<% %>`, `<%= %>`, `<%@ Language %>`, and `<!-- #include -->` directives parsed per page; ordinary comments pass through. |
+| Include resolution | Built | `file` resolves against the containing page's directory, `virtual` against the app root; path-confinement checks, 32-depth cycle detection. |
+| VBScript lexer | Built | Case-insensitive keywords, strings with `""` escapes, `'` comments, `_` continuations, hex/octal literals, statement line-end tracking. |
+| VBScript parser and AST | Built | Expressions with full precedence, Dim/Const, assignment, If/ElseIf/Else (block and single-line), For/Next and Do/Loop (deferred openers for cross-block bodies), Response/Request/Session targets. |
+| VBScript evaluator | Built | Deterministic tree-walking evaluator: variables, arithmetic, `&` concat, loops with iteration caps, builtins (Len/UCase/Left/Mid/InStr/CStr/...), per-request `ExecEnv` + buffered Response. |
 | Variant/value semantics | Not started | Needs careful coercion and equality rules. |
-| ASP intrinsic objects | Not started | `Request`, `Response`, `Server`, `Session`, `Application`. |
-| Request lifecycle | Not started | Buffer output, handle errors, enforce timeouts, produce responses. |
+| ASP intrinsic objects | In progress | `Response.Write/End/Clear` and the buffer passthrough work; `Request.QueryString` reads query/form/cookie data; Response controls (Redirect, ContentType, cookies) parse but their effects land in M3. |
+| Request lifecycle | In progress | Output buffers per request and ends early on `Response.End`; errors produce diagnostic pages/500s; timeouts and size limits still to come. |
 | Session state | Not started | Begin with signed cookie + in-process store; add Redis later if needed. |
 | Application state | Not started | Begin with per-process state. |
 | `global.asa` support | Not started | Start with application/session events; defer COM/library registration. |
 | Filesystem object mapping | Not started | Map `Scripting.FileSystemObject` to a sandboxed Rust implementation. |
 | Database/ADO support | Not started | Start with a small SQL adapter before trying broad ADO compatibility. |
 | JScript support | Not started | Optional; prioritize VBScript first. |
-| HTTP server integration | Not started | Map HTTP requests to the ASP runtime and stream buffered responses. |
+| HTTP server integration | Built | `tiny_http`-backed sequential server maps GET/POST URLs to `.asp` pages, applies the default document, decodes query/form/cookie data, and returns rendered bodies with 404/500 handling. |
 | Configuration | Not started | App root, port, timeouts, limits, logging, session settings. |
 | Security model | Not started | Path confinement, request limits, timeouts, non-root container. |
-| Golden and integration tests | In progress | Placeholder crates each carry a unit test; real fixtures start with the page parser. |
+| Golden and integration tests | Built | Crate-level unit tests across parser/lexer/evaluator/runtime plus end-to-end golden tests rendering `examples/hello-app` over the HTTP request path (exact bodies, 404/500 paths, querystring data). |
 | Docker image | Not started | Multi-stage Rust build; minimal runtime image; non-root user. |
 | Documentation and migration guide | In progress | `README.md` documents the Milestone 0 scaffold, quick start, and repository layout; migration and configuration documentation remain pending. |
 
@@ -257,7 +257,7 @@ Acceptance criteria:
 
 ### 7.2 ASP page model
 
-**Status:** Not started
+**Status:** In progress
 
 Responsibilities:
 
@@ -288,11 +288,17 @@ Acceptance criteria:
 - Include path traversal attempts fail safely.
 - Include cycles produce a clear diagnostic.
 
+Current state:
+
+- All "Initial support" items are implemented and tested except `<SCRIPT RUNAT=SERVER>` recognition.
+- Includes resolve with path confinement and depth-capped cycle detection.
+- Script is executed via a flattened statement stream so `For`/`Do` bodies can interleave literal markup across `<% %>` blocks (matching Classic ASP behavior); block `If` bodies must still live inside one `<% %>` block for now.
+
 ---
 
 ### 7.3 VBScript language engine
 
-**Status:** Not started
+**Status:** In progress
 
 This is the largest workstream. Build in phases rather than attempting a complete parser immediately.
 
@@ -623,7 +629,7 @@ Deferred until VBScript Phase 1–3 are stable.
 
 ### 7.11 HTTP server and CLI
 
-**Status:** Not started
+**Status:** In progress
 
 The executable should support:
 
@@ -787,7 +793,7 @@ Definition of done:
 
 ### Milestone 1 — Hello ASP
 
-**Status:** Not started
+**Status:** Built
 
 Deliverables:
 
@@ -967,9 +973,7 @@ This checklist applies before every pull request is marked ready for review.
 
 ## 12. Immediate next steps
 
-1. Implement the ASP page parser (text, `<% %>`, `<%= %>`, language directives).
-2. Implement a minimal VBScript expression evaluator.
-3. Implement `Response.Write` and render a `hello.asp` example through HTTP.
-4. Add the `run` and `check` CLI commands behind the placeholder stubs.
-5. Build golden tests for the first rendered pages.
-6. Keep this plan updated as each milestone becomes real.
+1. Milestone 2 — core language subset: arrays, procedures (`Sub`/`Function`/`Call`), conversions, `Date`/`Time` functions, and `Exit For`/`Exit Do`.
+2. Golden tests for each new language feature as it lands.
+3. Milestone 3 prep: finish the Response model (`Redirect`, `ContentType`, cookies) and request timeouts/size limits.
+4. Keep this plan updated as each milestone becomes real.
