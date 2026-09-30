@@ -26,11 +26,13 @@
 //! Runaway loops and runaway recursion are capped so a bad page
 //! surfaces as a runtime error instead of a hang.
 
+use crate::native::{NativeHost, NativeState, create_native};
 use crate::parser::{Expr, Param, Stmt, Variant, parse_number};
 use crate::vb_datetime;
 use asp_core::{AspError, AspResult, Diagnostic};
 use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Hard cap on loop iterations per loop statement (VBScript default
 /// script timeout serves the same purpose in IIS).
@@ -150,7 +152,7 @@ struct Frame {
 }
 
 /// Per-request execution state.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ExecEnv {
     vars: HashMap<String, Variant>,
     consts: HashMap<String, Variant>,
@@ -163,6 +165,9 @@ pub struct ExecEnv {
     pub request_data: HashMap<String, String>,
     /// `Request.ServerVariables("NAME")` values, keyed lowercase.
     pub server_variables: HashMap<String, String>,
+    /// Host services for native objects (`Server.Execute` render,
+    /// FileSystemObject file access). Absent in bare-engine tests.
+    pub host: Option<Rc<dyn NativeHost>>,
     /// Hoisted procedures keyed lower-case name.
     procs: HashMap<String, Proc>,
     /// Active procedure frame (locals shadowing), if any.
@@ -203,6 +208,13 @@ impl ExecEnv {
     pub fn with_state(mut self, stores: StateStores) -> Self {
         self.session = stores.session;
         self.application = stores.application;
+        self
+    }
+
+    /// Host services for native objects (`FileSystemObject` file
+    /// access, `Server.Execute` rendering).
+    pub fn with_host(mut self, host: Rc<dyn NativeHost>) -> Self {
+        self.host = Some(host);
         self
     }
 }
@@ -479,6 +491,48 @@ fn exec_plain(stmt: &Stmt, env: &mut ExecEnv) -> AspResult<Flow> {
             env.application.locked = false;
             Ok(Flow::Normal)
         }
+        Stmt::SetAssign { name, value } => {
+            let k = key(name);
+            if env.consts.contains_key(&k) {
+                return Err(rt_error(1, format!("cannot assign to Const '{name}'")));
+            }
+            let v = eval_expr(value, env)?;
+            assign_var(env, name, v);
+            Ok(Flow::Normal)
+        }
+        Stmt::ExprStatement(expr) => {
+            eval_expr(expr, env)?;
+            Ok(Flow::Normal)
+        }
+        Stmt::ServerExecute(path) => {
+            let Some(host) = env.host.as_ref() else {
+                return Err(rt_error(1, "Server.Execute needs a host"));
+            };
+            match host.render_sub_page(path) {
+                Ok(sub) => {
+                    env.response.chunks.push(sub.body);
+                    Ok(Flow::Normal)
+                }
+                Err(msg) => Err(rt_error(1, format!("Server.Execute: {msg}"))),
+            }
+        }
+        Stmt::ServerTransfer(path) => {
+            let Some(host) = env.host.as_ref() else {
+                return Err(rt_error(1, "Server.Transfer needs a host"));
+            };
+            match host.render_sub_page(path) {
+                Ok(sub) => {
+                    // Replace this page's output with the target's and
+                    // stop rendering this page.
+                    env.response.chunks.clear();
+                    env.response.chunks.push(sub.body);
+                    env.response.status = Some(sub.status);
+                    env.response.ended = true;
+                    Ok(Flow::Normal)
+                }
+                Err(msg) => Err(rt_error(1, format!("Server.Transfer: {msg}"))),
+            }
+        }
         Stmt::ResponseCall { verb, args } => {
             exec_response_call(verb, args, env)?;
             Ok(Flow::Normal)
@@ -529,6 +583,7 @@ fn truthy(v: Variant) -> bool {
         Variant::Date(_) => true,
         Variant::Arr(_) => true,
         Variant::ObjectRef(_) => true,
+        Variant::Native(_) => true,
     }
 }
 
@@ -713,6 +768,36 @@ fn eval_expr(expr: &Expr, env: &mut ExecEnv) -> AspResult<Variant> {
             .cloned()
             .map(Variant::Str)
             .unwrap_or(Variant::Empty)),
+        Expr::NativeNew(progid) => match create_native(progid) {
+            Ok(obj) => Ok(Variant::Native(obj)),
+            Err(msg) => Err(rt_error(1, msg)),
+        },
+        Expr::ServerMapPath(path) => {
+            let Some(host) = env.host.as_ref() else {
+                return Err(rt_error(1, "Server.MapPath needs a host"));
+            };
+            match host.map_path(path) {
+                Ok(mapped) => Ok(Variant::Str(mapped)),
+                Err(msg) => Err(rt_error(1, format!("Server.MapPath: {msg}"))),
+            }
+        }
+        Expr::NativeCall { obj, method, args } => {
+            let target = eval_expr(obj, env)?;
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(eval_expr(a, env)?);
+            }
+            exec_native_call(&target, method, &vals, env)
+        }
+        Expr::NativeProp { obj, prop } => {
+            let target = eval_expr(obj, env)?;
+            native_prop(&target, prop)
+        }
+        Expr::NativeDefault { obj, key } => {
+            let target = eval_expr(obj, env)?;
+            let kv = eval_expr(key, env)?;
+            native_default_get(&target, &kv)
+        }
         Expr::Neg(inner) => {
             let v = eval_expr(inner, env)?;
             match v {
@@ -736,6 +821,13 @@ fn eval_expr(expr: &Expr, env: &mut ExecEnv) -> AspResult<Variant> {
                 let decl = p.clone();
                 return call_procedure_inner(&decl, args, env, false, false);
             }
+            // Dictionary default-property read: `d("k")` with parens on a
+            // variable holding a native object.
+            if args.len() == 1 && matches!(lookup_var(env, name), Some(Variant::Native(_))) {
+                let target = lookup_var(env, name).unwrap();
+                let kv = eval_expr(&args[0], env)?;
+                return native_default_get(&target, &kv);
+            }
             // Array element read: `a(i)` — parens serve call and index.
             if args.len() == 1 && matches!(lookup_var(env, name), Some(Variant::Arr(_))) {
                 let Some(Variant::Arr(items)) = lookup_var(env, name) else {
@@ -753,6 +845,234 @@ fn eval_expr(expr: &Expr, env: &mut ExecEnv) -> AspResult<Variant> {
             eval_builtin(name, args, *line, env)
         }
     }
+}
+
+/// Call a method on a native object. Returns the method's value
+/// (usually `Empty` for mutating verbs).
+fn exec_native_call(
+    target: &Variant,
+    method: &str,
+    args: &[Variant],
+    env: &mut ExecEnv,
+) -> AspResult<Variant> {
+    let Variant::Native(obj) = target else {
+        return Err(rt_error(
+            1,
+            format!("'{method}' needs an object created by CreateObject"),
+        ));
+    };
+    let m = method.to_ascii_lowercase();
+    if matches!(&*obj.state.borrow(), NativeState::Dictionary(_)) {
+        exec_dict_call(&obj.state, &m, args)
+    } else {
+        exec_fso_call(&m, args, env)
+    }
+}
+
+/// `Scripting.FileSystemObject` dispatch: every filesystem verb goes
+/// through the host (app-root confinement lives there). Returns
+/// `Empty` for mutating verbs, the read value otherwise.
+fn exec_fso_call(m: &str, args: &[Variant], env: &mut ExecEnv) -> AspResult<Variant> {
+    let Some(host) = env.host.as_ref() else {
+        return Err(rt_error(
+            1,
+            "FileSystemObject needs a host (file access is not available here)",
+        ));
+    };
+    let host = host.clone();
+    let need = |n: usize| -> AspResult<()> {
+        if args.len() != n {
+            return Err(rt_error(
+                1,
+                format!(
+                    "FileSystemObject.{m} expects {n} argument(s), got {}",
+                    args.len()
+                ),
+            ));
+        }
+        Ok(())
+    };
+    let s = |i: usize| -> AspResult<String> {
+        match args.get(i) {
+            Some(v) => Ok(v.display()),
+            None => Err(rt_error(1, format!("{m} is missing argument {}", i + 1))),
+        }
+    };
+    let b = |i: usize, default: bool| -> bool {
+        match args.get(i) {
+            Some(v) => truthy(v.clone()),
+            None => default,
+        }
+    };
+    match m {
+        "fileexists" => {
+            need(1)?;
+            Ok(Variant::Bool(host.file_exists(&s(0)?).map_err(host_err)?))
+        }
+        "folderexists" => {
+            need(1)?;
+            Ok(Variant::Bool(host.folder_exists(&s(0)?).map_err(host_err)?))
+        }
+        "readtextfile" => {
+            need(1)?;
+            Ok(Variant::Str(host.read_text_file(&s(0)?).map_err(host_err)?))
+        }
+        "createtextfile" => {
+            need(2)?;
+            host.create_text_file(&s(0)?, &s(1)?, b(2, true))
+                .map_err(host_err)?;
+            Ok(Variant::Empty)
+        }
+        "appendtextfile" => {
+            need(2)?;
+            host.append_text_file(&s(0)?, &s(1)?).map_err(host_err)?;
+            Ok(Variant::Empty)
+        }
+        "deletefile" => {
+            need(1)?;
+            host.delete_file(&s(0)?, b(1, false)).map_err(host_err)?;
+            Ok(Variant::Empty)
+        }
+        "deletefolder" => {
+            need(1)?;
+            host.delete_folder(&s(0)?).map_err(host_err)?;
+            Ok(Variant::Empty)
+        }
+        "createfolder" => {
+            need(1)?;
+            host.create_folder(&s(0)?).map_err(host_err)?;
+            Ok(Variant::Empty)
+        }
+        "copyfile" => {
+            need(2)?;
+            host.copy_file(&s(0)?, &s(1)?, b(2, true))
+                .map_err(host_err)?;
+            Ok(Variant::Empty)
+        }
+        "movefile" => {
+            need(2)?;
+            host.move_file(&s(0)?, &s(1)?).map_err(host_err)?;
+            Ok(Variant::Empty)
+        }
+        "listfolder" => {
+            need(1)?;
+            let names = host.list_folder(&s(0)?).map_err(host_err)?;
+            Ok(Variant::Arr(names.into_iter().map(Variant::Str).collect()))
+        }
+        _ => Err(rt_error(
+            1,
+            format!("'FileSystemObject.{m}' is not supported"),
+        )),
+    }
+}
+
+/// Host errors become runtime errors with a uniform prefix.
+fn host_err(msg: String) -> AspError {
+    rt_error(1, format!("FileSystemObject: {msg}"))
+}
+
+/// `Scripting.Dictionary` method dispatch.
+fn exec_dict_call(
+    state: &std::cell::RefCell<NativeState>,
+    m: &str,
+    args: &[Variant],
+) -> AspResult<Variant> {
+    let need = |n: usize| -> AspResult<()> {
+        if args.len() != n {
+            return Err(rt_error(
+                1,
+                format!("Dictionary.{m} expects {n} argument(s), got {}", args.len()),
+            ));
+        }
+        Ok(())
+    };
+    let mut state = state.borrow_mut();
+    let NativeState::Dictionary(pairs) = &mut *state else {
+        unreachable!("dispatch checked the kind");
+    };
+    match m {
+        "add" => {
+            need(2)?;
+            let k = args[0].clone();
+            if pairs.iter().any(|(ek, _)| ek == &k) {
+                return Err(rt_error(
+                    1,
+                    "This key is already associated with an element of this collection",
+                ));
+            }
+            pairs.push((k, args[1].clone()));
+            Ok(Variant::Empty)
+        }
+        "exists" => {
+            need(1)?;
+            Ok(Variant::Bool(pairs.iter().any(|(k, _)| k == &args[0])))
+        }
+        "items" => {
+            need(0)?;
+            Ok(Variant::Arr(pairs.iter().map(|(_, v)| v.clone()).collect()))
+        }
+        "keys" => {
+            need(0)?;
+            Ok(Variant::Arr(pairs.iter().map(|(k, _)| k.clone()).collect()))
+        }
+        "remove" => {
+            need(1)?;
+            let before = pairs.len();
+            pairs.retain(|(k, _)| k != &args[0]);
+            if pairs.len() == before {
+                return Err(rt_error(1, "Element not found in this dictionary"));
+            }
+            Ok(Variant::Empty)
+        }
+        "removeall" => {
+            need(0)?;
+            pairs.clear();
+            Ok(Variant::Empty)
+        }
+        _ => Err(rt_error(1, format!("'Dictionary.{m}' is not supported"))),
+    }
+}
+
+/// Read a Dictionary default value `dict(key)` / `dict.Item(key)`.
+fn native_default_get(target: &Variant, kv: &Variant) -> AspResult<Variant> {
+    if let Variant::Native(obj) = target
+        && let NativeState::Dictionary(pairs) = &*obj.state.borrow()
+    {
+        return pairs
+            .iter()
+            .find(|(k, _)| k == kv)
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| rt_error(1, "Element not found in this dictionary"));
+    }
+    Err(rt_error(
+        1,
+        "only Dictionary supports a default property read",
+    ))
+}
+
+/// Read a native object property (`Dictionary.Count`).
+fn native_prop(target: &Variant, prop: &str) -> AspResult<Variant> {
+    let Variant::Native(obj) = target else {
+        return Err(rt_error(
+            1,
+            format!("'{prop}' needs an object created by CreateObject"),
+        ));
+    };
+    if let NativeState::Dictionary(pairs) = &*obj.state.borrow() {
+        if prop.eq_ignore_ascii_case("count") {
+            return Ok(Variant::Int(pairs.len() as i64));
+        }
+        if prop.eq_ignore_ascii_case("keys") {
+            return Ok(Variant::Arr(pairs.iter().map(|(k, _)| k.clone()).collect()));
+        }
+        if prop.eq_ignore_ascii_case("items") {
+            return Ok(Variant::Arr(pairs.iter().map(|(_, v)| v.clone()).collect()));
+        }
+    }
+    Err(rt_error(
+        1,
+        format!("'{prop}' is not a supported property of this object"),
+    ))
 }
 
 /// Call a procedure by name (used by `CallStmt`).

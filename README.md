@@ -8,7 +8,7 @@ RASP runs existing Classic ASP applications from a single Rust binary (or a
 Docker image) on Linux, macOS, Windows, or any platform that supports
 containers — no Windows or IIS required.
 
-## Status: Request/response and state (Milestone 4)
+## Status: Objects and filesystem (Milestone 5)
 
 Workstreams and milestones are tracked in
 [docs/asp-classic-interpreter-plan.md](docs/asp-classic-interpreter-plan.md).
@@ -25,7 +25,10 @@ plus `Request.ServerVariables`, `#include` directives,
 `<SCRIPT RUNAT=Server>` blocks, and `global.asa` events — served over
 HTTP with session state: `Session` values (`Contents`, `SessionID`,
 `Timeout`, `Abandon`) behind an `ASPSESSIONID` cookie and shared
-`Application` values with `Lock`/`UnLock`.
+`Application` values with `Lock`/`UnLock`. Native objects come next to
+`Server.CreateObject`: a sandboxed `Scripting.FileSystemObject` (paths
+stay inside the application root) and `Scripting.Dictionary`, plus
+`Server.MapPath`/`Execute`/`Transfer`.
 
 ## Quick start
 
@@ -47,6 +50,10 @@ curl http://127.0.0.1:8080/loop.asp
 # Session + Application state demo (send the cookie back to count up)
 curl -c /tmp/jar.txt http://127.0.0.1:8080/state.asp
 curl -b /tmp/jar.txt http://127.0.0.1:8080/state.asp
+
+# Native objects: a Dictionary, and the sandboxed folder listing
+curl http://127.0.0.1:8080/dict.asp
+curl http://127.0.0.1:8080/files.asp
 
 # Or via Docker
 docker build -t rasp .

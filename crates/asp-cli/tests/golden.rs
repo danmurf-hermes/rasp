@@ -252,3 +252,53 @@ fn golden_global_asa_app_values_are_shared() {
     assert!(a2.body.contains("Your views: 2"), "{}", a2.body);
     assert!(a2.body.contains("All views: 3"), "{}", a2.body);
 }
+
+#[test]
+fn golden_dictionary_page() {
+    let response = stateful_get(
+        &asp_http::ServerHolder::for_app_root(&app()).unwrap(),
+        "/dict.asp",
+        None,
+    );
+    assert_eq!(
+        response.body,
+        "\n\n<ul>\n<li>tea: 1.20</li><li>coffee: 1.40</li><li>cake: 2.10</li>\n</ul>\n<p>3 items</p>"
+    );
+}
+
+#[test]
+fn golden_files_page_lists_sandboxed_folder() {
+    let response = stateful_get(
+        &asp_http::ServerHolder::for_app_root(&app()).unwrap(),
+        "/files.asp",
+        None,
+    );
+    // The sandbox lists the example app's own files (sorted).
+    for name in ["arrays.asp", "dict.asp", "global.asa", "state.asp"] {
+        assert!(
+            response.body.contains(&format!("<li>{name}</li>")),
+            "{}",
+            response.body
+        );
+    }
+}
+
+#[test]
+fn golden_execute_and_transfer_pages() {
+    // Write the pages this test needs; each holder is a fresh process
+    // state so Execute/Transfer behaviours are deterministic.
+    let root = example_app();
+    std::fs::write(root.join("sub.asp"), "SUB").unwrap();
+    std::fs::write(root.join("exec.asp"), "A<% Server.Execute \"sub.asp\" %>B").unwrap();
+    std::fs::write(
+        root.join("transfer.asp"),
+        "A<% Server.Transfer \"sub.asp\" %>B",
+    )
+    .unwrap();
+    let holder = asp_http::ServerHolder::for_app_root(&app()).unwrap();
+    assert_eq!(stateful_get(&holder, "/exec.asp", None).body, "ASUBB");
+    assert_eq!(stateful_get(&holder, "/transfer.asp", None).body, "SUB");
+    let _ = std::fs::remove_file(root.join("sub.asp"));
+    let _ = std::fs::remove_file(root.join("exec.asp"));
+    let _ = std::fs::remove_file(root.join("transfer.asp"));
+}

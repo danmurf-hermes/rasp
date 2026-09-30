@@ -15,7 +15,7 @@ use asp_runtime::{
 };
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// Maximum accepted request body (form posts), bytes.
 const MAX_BODY_BYTES: usize = 1_048_576;
@@ -327,11 +327,10 @@ fn html_escape(s: &str) -> String {
 /// Returns an error only when the listener or `global.asa` cannot be
 /// initialised.
 pub fn serve(app: &AppRoot, config: &ServerConfig) -> asp_core::AspResult<()> {
-    let holder = Arc::new(ServerHolder::for_app_root(app)?);
+    let holder = ServerHolder::for_app_root(app)?;
     let addr = format!("{}:{}", config.host, config.port);
     let server = tiny_http::Server::http(&addr)
         .map_err(|e| asp_core::AspError::Io(format!("cannot bind {addr}: {e}")))?;
-    let server = Arc::new(server);
     loop {
         let mut request = match server.recv() {
             Ok(r) => r,

@@ -11,6 +11,7 @@ pub use parser::Page;
 ///
 /// Relative page paths (`hello.asp`, `inner/footer.asp`) are resolved
 /// against it; absolute and `..`-carrying paths are rejected.
+#[derive(Clone)]
 pub struct AppRoot {
     root: std::path::PathBuf,
 }

@@ -2,6 +2,7 @@
 
 pub mod eval;
 pub mod lexer;
+pub mod native;
 pub mod parser;
 pub mod vb_datetime;
 
@@ -10,6 +11,7 @@ pub use eval::{
     StateStores, exec_block, exec_block_loops,
 };
 pub use lexer::Tok;
+pub use native::{NativeHost, NativeObj, NativeState, SubPage, create_native};
 pub use parser::{Expr, Stmt, Variant, parse_block};
 
 #[cfg(test)]
@@ -389,12 +391,65 @@ End If";
 
     #[test]
     fn unsupported_features_are_clear_errors() {
-        let err = parse_block("Set x = Server.CreateObject(\"Thing\")", 1).unwrap_err();
-        assert!(matches!(err, AspError::Syntax(d) if d.message.contains("not supported")));
+        // Unknown ProgID is a RUNTIME error now (registry lookup fails).
+        let err = render_err("Set x = Server.CreateObject(\"Thing\")");
+        assert!(matches!(err, AspError::Runtime(d) if d.message.contains("not available")));
         let err = parse_block("On Error Resume Next", 1).unwrap_err();
         assert!(matches!(err, AspError::Syntax(d) if d.message.contains("not supported")));
         let err = parse_block("ReDim a(5)", 1).unwrap_err();
         assert!(matches!(err, AspError::Syntax(d) if d.message.contains("not supported")));
+    }
+
+    #[test]
+    fn dictionary_round_trip() {
+        let out = render(
+            "Set d = Server.CreateObject(\"Scripting.Dictionary\")\n\
+             d.Add \"name\", \"dan\"\n\
+             d.Add \"age\", 43\n\
+             Response.Write d(\"name\") & \"/\" & d.Item(\"age\") & \"/\" & d.Count",
+        );
+        assert_eq!(out, "dan/43/2");
+    }
+
+    #[test]
+    fn dictionary_exists_remove_and_errors() {
+        let out = render(
+            "Set d = Server.CreateObject(\"Scripting.Dictionary\")\n\
+             d.Add \"a\", 1\n\
+             Response.Write d.Exists(\"a\") & \"\" & d.Exists(\"b\")",
+        );
+        assert_eq!(out, "TrueFalse");
+        let err = render_err(
+            "Set d = Server.CreateObject(\"Scripting.Dictionary\")\n d.Add \"a\", 1\n d.Add \"a\", 2",
+        );
+        assert!(matches!(err, AspError::Runtime(d) if d.message.contains("already associated")));
+        let err = render_err(
+            "Set d = Server.CreateObject(\"Scripting.Dictionary\")\n Response.Write d(\"nope\")",
+        );
+        assert!(matches!(err, AspError::Runtime(d) if d.message.contains("Element not found")));
+        let err = render_err(
+            "Set d = Server.CreateObject(\"Scripting.Dictionary\")\n d.Remove(\"nope\")",
+        );
+        assert!(matches!(err, AspError::Runtime(d) if d.message.contains("Element not found")));
+    }
+
+    #[test]
+    fn native_objects_share_reference_semantics() {
+        let out = render(
+            "Set a = Server.CreateObject(\"Scripting.Dictionary\")\n\
+             Set b = a\n\
+             b.Add \"k\", \"v\"\n\
+             Response.Write a(\"k\")",
+        );
+        assert_eq!(out, "v");
+    }
+
+    #[test]
+    fn fso_without_host_is_a_clear_error() {
+        let err = render_err(
+            "Set f = Server.CreateObject(\"Scripting.FileSystemObject\")\n Response.Write f.FileExists(\"x.txt\")",
+        );
+        assert!(matches!(err, AspError::Runtime(d) if d.message.contains("needs a host")));
     }
 
     #[test]
