@@ -3,6 +3,13 @@
 //! M1 covers the `Response` object (Write/End/Clear/buffer passthrough),
 //! assembly of preprocessed pages (includes resolved, cycles detected),
 //! and one-shot rendering of a parsed page into a full HTTP response.
+//! M4 adds session/application state ([`session`]) and `global.asa`
+//! event firing around the render.
+
+pub mod session;
+
+pub use asp_vbscript::StateStores;
+pub use session::{GlobalAsa, SESSION_COOKIE_NAME, SessionManager, fire_global_asa_events};
 
 use asp_core::error::Diagnostic;
 use asp_core::parser::{Block, Page};
@@ -115,6 +122,12 @@ fn assemble_from_source(
                 let child = assemble(app, &full, seen)?;
                 steps.extend(child.steps);
             }
+            Block::ServerScript { body, .. } => {
+                // Server-side <SCRIPT> statements splice into the stream
+                // exactly like <% %> blocks (procedure declarations are
+                // hoisted by the executor's nesting pass).
+                steps.push(RenderStep::Script(parse_block(body, 1)?));
+            }
         }
     }
     seen.pop();
@@ -155,6 +168,12 @@ pub struct RenderOutput {
     pub cookies: Vec<asp_vbscript::Cookie>,
     /// `Response.Redirect target` set on this render.
     pub redirect: Option<String>,
+    /// Session state after the render (mutations included). The caller
+    /// commits it back to the manager; when `abandoned`, the store is
+    /// dropped instead.
+    pub session: Option<asp_vbscript::SessionStore>,
+    /// Application state after the render.
+    pub application: Option<asp_vbscript::ApplicationState>,
 }
 
 /// Render an assembled page end to end against a base environment.
@@ -179,6 +198,8 @@ pub fn render_assembled(assembled: &AssembledPage, base_env: &ExecEnv) -> AspRes
     out.headers = env.response.headers.clone();
     out.cookies = env.response.cookies.clone();
     out.redirect = env.response.redirect.clone();
+    out.session = Some(env.session.clone());
+    out.application = Some(env.application.clone());
     Ok(out)
 }
 
@@ -221,10 +242,11 @@ fn flatten_steps(steps: &[RenderStep]) -> AspResult<Vec<asp_vbscript::Stmt>> {
 /// Build the request-scoped environment from the base one.
 fn fresh_env(base: &ExecEnv) -> ExecEnv {
     let mut env = ExecEnv::new();
-    // Request data (query/form/cookies) is the request's; session state
-    // sharing across pages arrives with Session support (M4) but the
-    // values themselves are carried through for the same request.
+    // Request data (query/form/cookies) is the request's; session and
+    // application state are the cross-request stores the caller passed
+    // in and are carried through (mutations land back there afterward).
     env.session = base.session.clone();
+    env.application = base.application.clone();
     env.request_data = base.request_data.clone();
     env.server_variables = base.server_variables.clone();
     env
@@ -256,7 +278,8 @@ pub fn url_decode(input: &str) -> String {
 }
 
 /// Top-level render of a page by path: read, parse, assemble, execute.
-/// `server_variables` feeds `Request.ServerVariables`.
+/// `server_variables` feeds `Request.ServerVariables`. No cross-request
+/// state: the page starts with an empty session/application.
 pub fn render_page(
     app: &AppRoot,
     root_relative: &str,
@@ -272,12 +295,40 @@ pub fn render_page_with(
     request_data: HashMap<String, String>,
     server_variables: HashMap<String, String>,
 ) -> AspResult<RenderOutput> {
+    render_page_stores(
+        app,
+        root_relative,
+        request_data,
+        server_variables,
+        &StateStores::default(),
+    )
+    .map(|(out, _)| out)
+}
+
+/// Render with cross-request state: the stores are cloned into the
+/// render environment and the (possibly mutated) stores come back in
+/// the output. `session_is_new`/`global_asa` event firing is the
+/// caller's job (`fire_global_asa_events`) so a failing page still
+/// commits event writes; this function only renders.
+pub fn render_page_stores(
+    app: &AppRoot,
+    root_relative: &str,
+    request_data: HashMap<String, String>,
+    server_variables: HashMap<String, String>,
+    stores: &StateStores,
+) -> AspResult<(RenderOutput, StateStores)> {
     let mut seen = Vec::new();
     let assembled = assemble(app, root_relative, &mut seen)?;
     let base = ExecEnv::new()
         .with_request_data(request_data)
-        .with_server_variables(server_variables);
-    render_assembled(&assembled, &base)
+        .with_server_variables(server_variables)
+        .with_state(stores.clone());
+    let out = render_assembled(&assembled, &base)?;
+    let exit_stores = StateStores {
+        session: out.session.clone().unwrap_or_default(),
+        application: out.application.clone().unwrap_or_default(),
+    };
+    Ok((out, exit_stores))
 }
 
 #[cfg(test)]

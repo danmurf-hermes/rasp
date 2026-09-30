@@ -1,0 +1,17 @@
+<SCRIPT RUNAT=Server LANGUAGE="VBScript">
+Sub Application_OnStart
+  Application("app_booted") = "yes"
+End Sub
+</SCRIPT>
+
+<SCRIPT RUNAT=Server LANGUAGE="VBScript">
+Sub Session_OnStart
+  Session("page_views") = 0
+End Sub
+</SCRIPT>
+
+<SCRIPT RUNAT=Server LANGUAGE="VBScript">
+Sub Session_OnEnd
+  ' In-process sessions end with the process; nothing to clean up yet.
+End Sub
+</SCRIPT>

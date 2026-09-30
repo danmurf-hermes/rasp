@@ -3,7 +3,7 @@
 //! directives, exactly as Classic ASP preprocesses a page before the
 //! script engine sees it.
 
-use crate::error::{AspError, AspResult};
+use crate::error::{AspError, AspResult, Diagnostic};
 
 /// One preprocessed piece of an ASP page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +17,14 @@ pub enum Block {
     /// `<!-- #include file="..." -->` or `<!-- #include virtual="..." -->`.
     /// Stored as `kind:path` (no leading slash); resolved by the assembler.
     Include { path: String },
+    /// `<SCRIPT RUNAT="Server">…</SCRIPT>`: a server-side script block
+    /// whose body is parsed like a `<% %>` block (its `Sub`/`Function`
+    /// declarations are visible to the whole page). Client-side script
+    /// stays inside `Text`.
+    ServerScript {
+        language: Option<String>,
+        body: String,
+    },
 }
 
 impl Block {
@@ -94,6 +102,16 @@ impl<'s> Parser<'s> {
                 text_start = i;
                 continue;
             }
+            // Case-insensitive `<script` element start: consumed when it
+            // declares RUNAT="Server", otherwise page text.
+            if starts_with_ignore_case(self.bytes, i, b"<script")
+                && let Some(end) = self.try_parse_server_script(i)?
+            {
+                self.push_text(text_start, i);
+                text_start = end;
+                i = end;
+                continue;
+            }
             // Case-insensitive `<!--` comment start; may be an include.
             if at(i, b"<!--")
                 && let Some(end) = self.find_comment_end(i + 4)
@@ -108,8 +126,11 @@ impl<'s> Parser<'s> {
                         continue;
                     }
                     None => {
-                        // Ordinary HTML comment: part of the page output.
-                        i += 4;
+                        // Ordinary HTML comment: part of the page output,
+                        // skipped whole so `<script` inside one is never
+                        // mistaken for a server element.
+                        self.line += comment.bytes().filter(|&b| b == b'\n').count();
+                        i = end + 3;
                         continue;
                     }
                 }
@@ -206,6 +227,71 @@ impl<'s> Parser<'s> {
         Ok(())
     }
 
+    /// Check for a `<SCRIPT ...>` element starting at `start`. Returns
+    /// `Ok(Some(end))` when it is a server-side element (consumed through
+    /// `</script>`), `Ok(None)` when it is plain page text (client-side
+    /// script stays in the output), and a syntax error for a server
+    /// element whose `>` is missing or language is unsupported.
+    fn try_parse_server_script(&mut self, start: usize) -> AspResult<Option<usize>> {
+        let bytes = self.bytes;
+        // The caller matched a literal `<script` prefix; attributes begin
+        // right after it.
+        let Some(gt) = find_ignore_case(bytes, start + 7, b">") else {
+            return Err(AspError::Syntax(Diagnostic::new(
+                self.line,
+                "unterminated <script> tag: missing '>'",
+            )));
+        };
+        let mut attrs = AttrParser::new(&self.source[start + 7..gt]);
+        let mut language = None;
+        let mut runat_server = false;
+        while let Some((name, value)) = attrs.next_attr() {
+            match name.as_str() {
+                "runat" => {
+                    if value.eq_ignore_ascii_case("server") {
+                        runat_server = true;
+                    }
+                }
+                "language" => language = Some(value.to_ascii_lowercase()),
+                _ => {}
+            }
+        }
+        // Without RUNAT=Server the element is client-side text and stays
+        // in the page output.
+        if !runat_server {
+            return Ok(None);
+        }
+        let lang = language.ok_or_else(|| {
+            AspError::Syntax(Diagnostic::new(
+                self.line,
+                "<SCRIPT RUNAT=Server> requires a Language attribute",
+            ))
+        })?;
+        if lang != "vbscript" {
+            return Err(AspError::UnsupportedLanguage(lang));
+        }
+        let Some(close) = find_ignore_case(bytes, gt + 1, b"</script") else {
+            return Err(AspError::Syntax(Diagnostic::new(
+                self.line,
+                "unterminated <SCRIPT RUNAT=Server> block: missing </script>",
+            )));
+        };
+        let Some(gt2) = find_ignore_case(bytes, close, b">") else {
+            return Err(AspError::Syntax(Diagnostic::new(
+                self.line,
+                "unterminated </script> closing tag",
+            )));
+        };
+        let body = self.source[gt + 1..close].to_string();
+        let newline_count = body.bytes().filter(|&b| b == b'\n').count();
+        self.line += newline_count;
+        self.blocks.push(Block::ServerScript {
+            language: Some("vbscript".to_string()),
+            body,
+        });
+        Ok(Some(gt2 + 1))
+    }
+
     /// Find the end of a `-->` starting the search at `from`.
     /// Returns the byte offset of the `-` that begins `-->`.
     fn find_comment_end(&self, from: usize) -> Option<usize> {
@@ -261,6 +347,69 @@ fn strip_quotes(rest: &str) -> Option<String> {
         Some(s[1..s.len() - 1].to_string())
     } else {
         None
+    }
+}
+
+/// Case-insensitive search for `needle` in `bytes` from `from`.
+fn find_ignore_case(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || from > bytes.len() || bytes.len() < needle.len() {
+        return None;
+    }
+    (from..=bytes.len() - needle.len()).find(|&i| {
+        bytes[i..i + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(b, n)| b.eq_ignore_ascii_case(n))
+    })
+}
+
+/// True when `bytes[from..]` starts with `prefix` (case-insensitive).
+fn starts_with_ignore_case(bytes: &[u8], from: usize, prefix: &[u8]) -> bool {
+    from + prefix.len() <= bytes.len()
+        && bytes[from..from + prefix.len()]
+            .iter()
+            .zip(prefix)
+            .all(|(b, p)| b.eq_ignore_ascii_case(p))
+}
+
+/// Attribute reader for `<SCRIPT RUNAT="Server" LANGUAGE="VBScript">`
+/// open tags: splits the region between `<script` and `>` into
+/// `name=value` attributes (quoted or bare), case-insensitive names.
+struct AttrParser<'a> {
+    attrs: &'a str,
+}
+
+impl<'a> AttrParser<'a> {
+    fn new(attrs: &'a str) -> Self {
+        Self { attrs }
+    }
+
+    /// Next `(lower-cased name, value)` attribute, or `None` at the end.
+    /// Unparseable attribute syntax stops the scan (the caller reports
+    /// its own error for the tag as a whole).
+    fn next_attr(&mut self) -> Option<(String, String)> {
+        let rest = self.attrs.trim_start();
+        if rest.is_empty() {
+            return None;
+        }
+        let eq = rest.find('=')?;
+        let name = rest[..eq].trim().to_ascii_lowercase();
+        let after_eq = rest[eq + 1..].trim_start();
+        let (value, consumed) = if let Some(quoted) = after_eq.strip_prefix('"') {
+            let end = quoted.find('"')?;
+            (
+                quoted[..end].to_string(),
+                rest.len() - quoted.len() + end + 1,
+            )
+        } else {
+            let end = after_eq.find(char::is_whitespace).unwrap_or(after_eq.len());
+            (
+                after_eq[..end].to_string(),
+                rest.len() - after_eq.len() + end,
+            )
+        };
+        self.attrs = &rest[consumed..];
+        Some((name, value))
     }
 }
 
@@ -376,5 +525,64 @@ mod tests {
     fn multi_line_script_counts_lines() {
         let err = Page::parse("a\n<%\nx = 1").unwrap_err();
         assert!(matches!(err, AspError::Syntax(d) if d.line == 2));
+    }
+
+    #[test]
+    fn server_script_block_is_parsed() {
+        let blocks = parse(
+            "<SCRIPT RUNAT=Server LANGUAGE=\"VBScript\">\nSub greet(who)\nResponse.Write who\nEnd Sub\n</SCRIPT>",
+        );
+        assert_eq!(
+            blocks,
+            vec![Block::ServerScript {
+                language: Some("vbscript".into()),
+                body: "\nSub greet(who)\nResponse.Write who\nEnd Sub\n".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn server_script_lowercase_and_bare_attrs() {
+        let blocks = parse("<script language=vbscript runat=Server>total = 1</SCRIPT>");
+        assert_eq!(
+            blocks,
+            vec![Block::ServerScript {
+                language: Some("vbscript".into()),
+                body: "total = 1".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn client_script_stays_literal_text() {
+        let src = "<script type=\"text/javascript\">var a = 1;</script><p>hi</p>";
+        assert_eq!(parse(src), vec![Block::Text(src.into())]);
+    }
+
+    #[test]
+    fn server_script_requires_vbscript() {
+        let err = Page::parse("<SCRIPT RUNAT=Server LANGUAGE=JScript>x</SCRIPT>").unwrap_err();
+        assert!(
+            matches!(err, AspError::UnsupportedLanguage(l) if l.eq_ignore_ascii_case("jscript"))
+        );
+    }
+
+    #[test]
+    fn server_script_requires_language_attr() {
+        let err = Page::parse("<SCRIPT RUNAT=Server>x</SCRIPT>").unwrap_err();
+        assert!(matches!(err, AspError::Syntax(d) if d.message.contains("Language")));
+    }
+
+    #[test]
+    fn server_script_missing_close_is_error() {
+        let err =
+            Page::parse("<SCRIPT RUNAT=Server LANGUAGE=VBScript>Sub a()\nEnd Sub").unwrap_err();
+        assert!(matches!(err, AspError::Syntax(d) if d.message.contains("missing </script>")));
+    }
+
+    #[test]
+    fn script_inside_comment_is_not_mistaken_for_server_element() {
+        let src = "a<!-- <script> var x = '</script>'; </script> -->b";
+        assert_eq!(parse(src), vec![Block::Text(src.into())]);
     }
 }

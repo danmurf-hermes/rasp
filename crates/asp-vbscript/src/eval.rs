@@ -48,6 +48,54 @@ pub struct Cookie {
     pub value: String,
 }
 
+/// Per-session state: named values plus the session's identity and
+/// settings. Lives for one visitor across requests (in-process store;
+/// the session cookie identifies it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionStore {
+    /// Named values (`Session("k") = v`), keyed case-insensitively.
+    pub values: HashMap<String, Variant>,
+    /// Numeric session identity (rendered hex in `Session.SessionID`).
+    pub id: u32,
+    /// Idle minutes before expiry (VBScript default: 20).
+    pub timeout_min: i64,
+    /// `Session.Abandon` was called: the store is dropped at request end.
+    pub abandoned: bool,
+}
+
+impl SessionStore {
+    /// A fresh session: no values, default timeout. The numeric identity
+    /// is assigned by the caller (the session store); 0 means "unset".
+    pub fn new(id: u32) -> Self {
+        Self {
+            values: HashMap::new(),
+            id,
+            timeout_min: DEFAULT_SESSION_TIMEOUT_MIN,
+            abandoned: false,
+        }
+    }
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+/// VBScript's default session idle lifetime, minutes.
+pub const DEFAULT_SESSION_TIMEOUT_MIN: i64 = 20;
+
+/// Application-scope state shared by every request in the process.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ApplicationState {
+    /// Named values (`Application("k") = v`), keyed case-insensitively.
+    pub values: HashMap<String, Variant>,
+    /// True between `Application.Lock` and `Application.UnLock`.
+    pub locked: bool,
+    /// `Application_OnStart` has fired (once per process).
+    pub started: bool,
+}
+
 /// `Response` state for one render: a buffer plus a few properties.
 #[derive(Debug, Default)]
 pub struct ResponseBuffer {
@@ -106,7 +154,10 @@ struct Frame {
 pub struct ExecEnv {
     vars: HashMap<String, Variant>,
     consts: HashMap<String, Variant>,
-    pub session: HashMap<String, Variant>,
+    /// Session state: the visitor's named values, identity, and settings.
+    pub session: SessionStore,
+    /// Application-scope state shared across all requests.
+    pub application: ApplicationState,
     pub response: ResponseBuffer,
     /// Values for `Request.Collection("key")`, keyed `collection\0key`.
     pub request_data: HashMap<String, String>,
@@ -122,14 +173,12 @@ pub struct ExecEnv {
     call_depth: usize,
 }
 
-/// A hoisted procedure: parameters plus a normalized body. Declaration
-/// kind matters only for the `name = value` return convention.
-#[derive(Debug, Clone)]
-struct Proc {
-    name: String,
-    params: Vec<Param>,
-    body: Vec<StmtN>,
-    is_function: bool,
+/// Session and application state a fresh render starts from. Values are
+/// cloned in per render; mutations are copied out after it by the caller.
+#[derive(Debug, Clone, Default)]
+pub struct StateStores {
+    pub session: SessionStore,
+    pub application: ApplicationState,
 }
 
 impl ExecEnv {
@@ -148,6 +197,24 @@ impl ExecEnv {
         self.server_variables = vars;
         self
     }
+
+    /// Start the render from the given session/application stores (M4:
+    /// the HTTP layer keeps the cross-request stores and passes them in).
+    pub fn with_state(mut self, stores: StateStores) -> Self {
+        self.session = stores.session;
+        self.application = stores.application;
+        self
+    }
+}
+
+/// A hoisted procedure: parameters plus a normalized body. Declaration
+/// kind matters only for the `name = value` return convention.
+#[derive(Debug, Clone)]
+struct Proc {
+    name: String,
+    params: Vec<Param>,
+    body: Vec<StmtN>,
+    is_function: bool,
 }
 
 /// Control-flow outcome that escapes a statement.
@@ -373,7 +440,43 @@ fn exec_plain(stmt: &Stmt, env: &mut ExecEnv) -> AspResult<Flow> {
         }
         Stmt::SessionAssign { name, value } => {
             let v = eval_expr(value, env)?;
-            env.session.insert(key(name), v);
+            env.session.values.insert(key(name), v);
+            Ok(Flow::Normal)
+        }
+        Stmt::SessionContentsAssign { name, value } => {
+            let v = eval_expr(value, env)?;
+            env.session.values.insert(key(name), v);
+            Ok(Flow::Normal)
+        }
+        Stmt::SessionTimeoutAssign { value } => {
+            let v = eval_expr(value, env)?;
+            let minutes = v.as_number(1)? as i64;
+            if minutes < 1 {
+                return Err(rt_error(1, "Session.Timeout must be at least 1 minute"));
+            }
+            env.session.timeout_min = minutes;
+            Ok(Flow::Normal)
+        }
+        Stmt::SessionAbandon => {
+            env.session.abandoned = true;
+            Ok(Flow::Normal)
+        }
+        Stmt::ApplicationAssign { name, value } => {
+            let v = eval_expr(value, env)?;
+            env.application.values.insert(key(name), v);
+            Ok(Flow::Normal)
+        }
+        Stmt::ApplicationContentsAssign { name, value } => {
+            let v = eval_expr(value, env)?;
+            env.application.values.insert(key(name), v);
+            Ok(Flow::Normal)
+        }
+        Stmt::ApplicationLock => {
+            env.application.locked = true;
+            Ok(Flow::Normal)
+        }
+        Stmt::ApplicationUnlock => {
+            env.application.locked = false;
             Ok(Flow::Normal)
         }
         Stmt::ResponseCall { verb, args } => {
@@ -577,9 +680,17 @@ fn eval_expr(expr: &Expr, env: &mut ExecEnv) -> AspResult<Variant> {
         }
         Expr::SessionRead(name) => Ok(env
             .session
+            .values
             .get(&key(name))
             .cloned()
             .unwrap_or(Variant::Empty)),
+        Expr::ApplicationRead(name) => Ok(env
+            .application
+            .values
+            .get(&key(name))
+            .cloned()
+            .unwrap_or(Variant::Empty)),
+        Expr::SessionIdRead => Ok(Variant::Str(format!("{:x}", env.session.id))),
         Expr::RequestRead {
             collection,
             key: name,

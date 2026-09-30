@@ -8,7 +8,7 @@ RASP runs existing Classic ASP applications from a single Rust binary (or a
 Docker image) on Linux, macOS, Windows, or any platform that supports
 containers — no Windows or IIS required.
 
-## Status: Core language subset (Milestone 2)
+## Status: Request/response and state (Milestone 4)
 
 Workstreams and milestones are tracked in
 [docs/asp-classic-interpreter-plan.md](docs/asp-classic-interpreter-plan.md).
@@ -19,8 +19,13 @@ fixed-size arrays and `Array()`/`UBound`/`Split`/`Join`,
 `Sub`/`Function` procedures with `Call` and ByRef/ByVal parameters,
 conversions (`CInt`/`CLng` with banker's rounding, `CDbl`, `CBool`,
 `CDate`, `Is*`), Date/Time functions (`DateSerial`, `DateAdd`,
-`DateDiff`, `Year`/`Month`/`Day`/…), `Response.Write`/`End`/`Clear`,
-`Request.QueryString`, and `#include` directives, served over HTTP.
+`DateDiff`, `Year`/`Month`/`Day`/…), `Response.Write`/`End`/`Clear`
+plus `Response.Cookies`, `Request.QueryString`/`Form`/`Cookies`
+plus `Request.ServerVariables`, `#include` directives,
+`<SCRIPT RUNAT=Server>` blocks, and `global.asa` events — served over
+HTTP with session state: `Session` values (`Contents`, `SessionID`,
+`Timeout`, `Abandon`) behind an `ASPSESSIONID` cookie and shared
+`Application` values with `Lock`/`UnLock`.
 
 ## Quick start
 
@@ -38,6 +43,10 @@ cargo build -p asp-cli
 # Serve the example app over HTTP
 ./target/debug/rasp serve --root examples/hello-app --port 8080
 curl http://127.0.0.1:8080/loop.asp
+
+# Session + Application state demo (send the cookie back to count up)
+curl -c /tmp/jar.txt http://127.0.0.1:8080/state.asp
+curl -b /tmp/jar.txt http://127.0.0.1:8080/state.asp
 
 # Or via Docker
 docker build -t rasp .
