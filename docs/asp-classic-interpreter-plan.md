@@ -194,8 +194,8 @@ Any status change should be accompanied by a short note in the relevant section 
 
 | Area | Status | Current notes |
 |---|---|---|
-| Project scaffolding | Not started | No implementation exists yet. |
-| Cargo workspace and CI | Not started | Create the workspace, formatting, lint, test, and release pipeline. |
+| Project scaffolding | Built | Cargo workspace, five focused crates, placeholder `rasp` CLI (`version` works), README quick start. |
+| Cargo workspace and CI | Built | GitHub Actions quality job (fmt, clippy, test on Ubuntu and macOS) plus a Docker build/run smoke test. |
 | ASP page parser | Not started | Parse text, `<% %>`, `<%= %>`, and script language declarations. |
 | Include resolution | Not started | Implement `file` and `virtual`; protect against path traversal and cycles. |
 | VBScript lexer | Not started | Handle line-based syntax, case insensitivity, comments, strings, and line continuations. |
@@ -213,9 +213,9 @@ Any status change should be accompanied by a short note in the relevant section 
 | HTTP server integration | Not started | Map HTTP requests to the ASP runtime and stream buffered responses. |
 | Configuration | Not started | App root, port, timeouts, limits, logging, session settings. |
 | Security model | Not started | Path confinement, request limits, timeouts, non-root container. |
-| Golden and integration tests | Not started | Build fixtures from simple to realistic pages. |
+| Golden and integration tests | In progress | Placeholder crates each carry a unit test; real fixtures start with the page parser. |
 | Docker image | Not started | Multi-stage Rust build; minimal runtime image; non-root user. |
-| Documentation and migration guide | In progress | `README.md` describes the experimental scope and current planning-only status; migration and configuration documentation remain pending. |
+| Documentation and migration guide | In progress | `README.md` documents the Milestone 0 scaffold, quick start, and repository layout; migration and configuration documentation remain pending. |
 
 ---
 
@@ -223,7 +223,20 @@ Any status change should be accompanied by a short note in the relevant section 
 
 ### 7.1 Project scaffolding and quality gates
 
-**Status:** Not started
+**Status:** Built
+
+Current state:
+
+- Root `Cargo.toml` workspace with crates `asp-core`, `asp-vbscript`,
+  `asp-runtime`, `asp-http`, and `asp-cli` (binary `rasp`).
+- Each placeholder crate compiles with a unit test; the CLI reports its
+  version and rejects not-yet-implemented subcommands with exit code 2.
+- CI quality job runs `cargo fmt --check`, clippy, and `cargo test --all` on
+  Ubuntu and macOS, plus a Docker build/run smoke test.
+- `Dockerfile` builds the release binary into a non-root `debian` runtime
+  image (numeric `USER 1000`, because `debian:stable-slim` ships no
+  `adduser`); `cargo fmt` and `cargo clippy` are the effective formatting and
+  lint configuration (no `rustfmt.toml` needed).
 
 Create:
 
@@ -756,7 +769,7 @@ Acceptance criteria:
 
 ### Milestone 0 — Skeleton
 
-**Status:** Not started
+**Status:** Built
 
 Deliverables:
 
@@ -954,10 +967,9 @@ This checklist applies before every pull request is marked ready for review.
 
 ## 12. Immediate next steps
 
-1. Create the Cargo workspace and focused crates.
-2. Add the CLI skeleton with version and configuration reporting.
-3. Add CI quality gates.
-4. Implement the ASP page parser and minimal expression evaluator.
-5. Render the first `hello.asp` example through HTTP.
-6. Add a placeholder Dockerfile.
-7. Keep this plan updated as each milestone becomes real.
+1. Implement the ASP page parser (text, `<% %>`, `<%= %>`, language directives).
+2. Implement a minimal VBScript expression evaluator.
+3. Implement `Response.Write` and render a `hello.asp` example through HTTP.
+4. Add the `run` and `check` CLI commands behind the placeholder stubs.
+5. Build golden tests for the first rendered pages.
+6. Keep this plan updated as each milestone becomes real.

@@ -1,0 +1,10 @@
+[package]
+name = "asp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Shared AST, values, errors, page model, and include model for RASP."
+
+[dependencies]
