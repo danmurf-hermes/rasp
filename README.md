@@ -42,6 +42,15 @@ docker run --rm rasp version
 `check` stays quiet when every page parses (exit 0); `run` prints the
 rendered body to stdout.
 
+## Development
+
+Quality gates (fmt → clippy → tests) run as a pre-commit hook; enable them
+once after cloning:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Repository layout
 
 ```text
