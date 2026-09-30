@@ -1,0 +1,11 @@
+[package]
+name = "asp-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ASP intrinsic objects, request lifecycle, state, and COM mappings for RASP."
+
+[dependencies]
+asp-core = { path = "../asp-core" }
