@@ -119,6 +119,8 @@ fn serve(
         host: host.to_string(),
         port,
         default_document: default_document.to_string(),
+        // `serve` is the development entry point: keep full diagnostics.
+        dev_errors: true,
     };
     println!(
         "rasp: serving {} on http://{}:{}",

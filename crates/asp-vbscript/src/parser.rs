@@ -165,8 +165,11 @@ pub enum Stmt {
     },
     /// `Session("name") = expr`
     SessionAssign { name: String, value: Expr },
-    /// Any `Response.verb [args]` call statement.
-    ResponseCall { verb: String, arg: Option<Expr> },
+    /// Any `Response.verb [args...]` call statement, including
+    /// property assignments (`Response.Status = "404 Not Found"`).
+    ResponseCall { verb: String, args: Vec<Expr> },
+    /// `Response.Cookies("name") = value` (attributes land later).
+    ResponseCookieAssign { name: Expr, value: Expr },
     /// `If cond Then stmt(s)` — block form when `else/elseif` present.
     If {
         branches: Vec<(Expr, Vec<Stmt>)>,
@@ -241,6 +244,8 @@ pub enum Expr {
         collection: String,
         key: String,
     },
+    /// `Request.ServerVariables("NAME")` read.
+    RequestServerVariable(String),
     /// Unary minus applied by the parser.
     Neg(Box<Expr>),
     Not(Box<Expr>),
@@ -1001,7 +1006,11 @@ impl P {
         }
     }
 
-    /// `Response.<verb>` as a statement; verbs checked against a whitelist.
+    /// `Response.<verb> [args]` as a statement, plus the M3 property
+    /// assignment forms:
+    /// - `Response.Status = expr`, `Response.ContentType = expr`, etc.
+    /// - `Response.Cookies("name") = expr` (sub-attributes like
+    ///   `Response.Cookies("x").Expires` land with full cookie support).
     fn parse_response_stmt(&mut self) -> AspResult<Stmt> {
         self.advance(); // response
         self.expect_sym(".")?;
@@ -1017,22 +1026,49 @@ impl P {
                 )));
             }
         };
+        if verb == "cookies" && matches!(self.peek(), Tok::Sym(s) if s == "(") {
+            // `Response.Cookies("name") = value`
+            self.advance();
+            let name = self.parse_expr()?;
+            self.expect_sym(")")?;
+            self.expect_sym("=")?;
+            let value = self.parse_expr()?;
+            if matches!(self.peek(), Tok::LineEnd) {
+                self.advance();
+            }
+            return Ok(Stmt::ResponseCookieAssign { name, value });
+        }
+        if matches!(self.peek(), Tok::Sym(s) if s == "=") {
+            // Property assignment: `Response.<verb> = expr`.
+            self.advance();
+            let value = self.parse_expr()?;
+            if matches!(self.peek(), Tok::LineEnd) {
+                self.advance();
+            }
+            return Ok(Stmt::ResponseCall {
+                verb,
+                args: vec![value],
+            });
+        }
         // `Response.Write <expr>`: the argument is always a full
         // expression. A leading `(` is just a parenthesised operand
         // (`Write (2+3) * 4` is valid), not a call-paren.
-        let arg = if matches!(self.peek(), Tok::LineEnd)
-            || matches!(self.peek(), Tok::Name(n) if n == "else")
+        let mut args = Vec::new();
+        if !matches!(self.peek(), Tok::LineEnd)
+            && !matches!(self.peek(), Tok::Name(n) if n == "else")
         {
-            None
-        } else {
-            Some(self.parse_expr()?)
-        };
+            args.push(self.parse_expr()?);
+            while matches!(self.peek(), Tok::Sym(s) if s == ",") {
+                self.advance();
+                args.push(self.parse_expr()?);
+            }
+        }
         // `Else` on the same line belongs to a single-line If arm; do not
         // treat it as this call's argument or the end-of-statement marker.
         if matches!(self.peek(), Tok::LineEnd) {
             self.advance();
         }
-        Ok(Stmt::ResponseCall { verb, arg })
+        Ok(Stmt::ResponseCall { verb, args })
     }
 
     /// `Session("name") = expr` as a statement.
@@ -1222,6 +1258,19 @@ impl P {
                         )));
                     }
                 };
+                if collection == "servervariables" {
+                    self.expect_sym("(")?;
+                    let key = match self.parse_expr()? {
+                        Expr::Literal(Variant::Str(s)) => s,
+                        _ => {
+                            return Err(
+                                self.error("ServerVariables requires a string variable name")
+                            );
+                        }
+                    };
+                    self.expect_sym(")")?;
+                    return Ok(Expr::RequestServerVariable(key));
+                }
                 self.expect_sym("(")?;
                 let key = match self.parse_expr()? {
                     Expr::Literal(Variant::Str(s)) => s,

@@ -41,12 +41,26 @@ const MAX_LOOP_ITERATIONS: u64 = 100_000;
 /// builds; real pages never approach this.
 const MAX_CALL_DEPTH: usize = 32;
 
+/// One outbound cookie (`Response.Cookies("name") = value`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cookie {
+    pub name: String,
+    pub value: String,
+}
+
 /// `Response` state for one render: a buffer plus a few properties.
 #[derive(Debug, Default)]
 pub struct ResponseBuffer {
     pub chunks: Vec<String>,
     pub status: Option<u16>,
+    pub status_text: Option<String>,
     pub content_type: Option<String>,
+    pub charset: Option<String>,
+    /// Extra headers in insertion order (`AddHeader` / `Expires` / …).
+    pub headers: Vec<(String, String)>,
+    pub cookies: Vec<Cookie>,
+    /// `Response.Redirect target` — 302 with Location, body dropped.
+    pub redirect: Option<String>,
     pub ended: bool,
 }
 
@@ -58,6 +72,20 @@ impl ResponseBuffer {
     /// Full buffered body so far.
     pub fn body(&self) -> String {
         self.chunks.join("")
+    }
+
+    /// Set a plain header (last write wins per name, insertion order kept).
+    pub fn set_header(&mut self, name: &str, value: &str) {
+        let lname = name.to_ascii_lowercase();
+        if let Some(slot) = self
+            .headers
+            .iter_mut()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&lname))
+        {
+            slot.1 = value.to_string();
+        } else {
+            self.headers.push((name.to_string(), value.to_string()));
+        }
     }
 }
 
@@ -82,6 +110,8 @@ pub struct ExecEnv {
     pub response: ResponseBuffer,
     /// Values for `Request.Collection("key")`, keyed `collection\0key`.
     pub request_data: HashMap<String, String>,
+    /// `Request.ServerVariables("NAME")` values, keyed lowercase.
+    pub server_variables: HashMap<String, String>,
     /// Hoisted procedures keyed lower-case name.
     procs: HashMap<String, Proc>,
     /// Active procedure frame (locals shadowing), if any.
@@ -110,6 +140,12 @@ impl ExecEnv {
     /// Pre-populate `Request` data (query-string/form/cookies).
     pub fn with_request_data(mut self, data: HashMap<String, String>) -> Self {
         self.request_data = data;
+        self
+    }
+
+    /// Pre-populate `Request.ServerVariables`.
+    pub fn with_server_variables(mut self, vars: HashMap<String, String>) -> Self {
+        self.server_variables = vars;
         self
     }
 }
@@ -340,8 +376,14 @@ fn exec_plain(stmt: &Stmt, env: &mut ExecEnv) -> AspResult<Flow> {
             env.session.insert(key(name), v);
             Ok(Flow::Normal)
         }
-        Stmt::ResponseCall { verb, arg } => {
-            exec_response_call(verb, arg.as_ref(), env)?;
+        Stmt::ResponseCall { verb, args } => {
+            exec_response_call(verb, args, env)?;
+            Ok(Flow::Normal)
+        }
+        Stmt::ResponseCookieAssign { name, value } => {
+            let name = eval_expr(name, env)?.display();
+            let value = eval_expr(value, env)?.display();
+            env.response.cookies.push(Cookie { name, value });
             Ok(Flow::Normal)
         }
         Stmt::ExitLoop { for_form } => Ok(Flow::ExitLoop(*for_form)),
@@ -554,6 +596,12 @@ fn eval_expr(expr: &Expr, env: &mut ExecEnv) -> AspResult<Variant> {
                 .map(Variant::Str)
                 .unwrap_or(Variant::Empty))
         }
+        Expr::RequestServerVariable(name) => Ok(env
+            .server_variables
+            .get(&key(name))
+            .cloned()
+            .map(Variant::Str)
+            .unwrap_or(Variant::Empty)),
         Expr::Neg(inner) => {
             let v = eval_expr(inner, env)?;
             match v {
@@ -857,41 +905,116 @@ fn compare(op: &str, lv: &Variant, rv: &Variant) -> AspResult<bool> {
     })
 }
 
-fn exec_response_call(verb: &str, arg: Option<&Expr>, env: &mut ExecEnv) -> AspResult<()> {
+fn exec_response_call(verb: &str, args: &[Expr], env: &mut ExecEnv) -> AspResult<()> {
+    // Property assignments arrive as one-arg calls (`Status = "404 x"`).
+    let prop = |env: &mut ExecEnv| -> AspResult<String> {
+        match args {
+            [v] => Ok(eval_expr(v, env)?.display()),
+            _ => Err(rt_error(1, format!("Response.{verb} requires a value"))),
+        }
+    };
     match verb {
         "write" => {
-            let v = match arg {
-                Some(e) => eval_expr(e, env)?,
-                None => Variant::Empty,
-            };
-            env.response.write(&v.display());
+            for a in args {
+                let v = eval_expr(a, env)?;
+                env.response.write(&v.display());
+            }
+            if args.is_empty() {
+                env.response.write("");
+            }
             Ok(())
         }
         "buffer" => {
             // Always buffered; accept and ignore the property value.
-            if let Some(e) = arg {
-                let _ = eval_expr(e, env)?;
+            for a in args {
+                let _ = eval_expr(a, env)?;
             }
             Ok(())
         }
-        "flush" | "clear" => {
+        "flush" => Ok(()),
+        "clear" => {
             // Real Clear drops buffered output; supported faithfully.
-            if verb == "clear" {
-                env.response.chunks.clear();
-            }
+            env.response.chunks.clear();
             Ok(())
         }
         "end" => {
             env.response.ended = true;
             Ok(())
         }
-        "binarywrite" | "redirect" | "addheader" | "appendtolog" | "contenttype" | "status"
-        | "charset" | "expires" | "cachecontrol" | "cookies" => {
-            // Accepted grammar; effects land with the full Response model (M3+).
-            if let Some(e) = arg {
-                eval_expr(e, env)?;
+        "redirect" => {
+            let target = match args {
+                [a] => eval_expr(a, env)?.display(),
+                _ => return Err(rt_error(1, "Response.Redirect requires a URL")),
+            };
+            env.response.redirect = Some(target);
+            // Classic ASP redirect ends page processing.
+            env.response.ended = true;
+            Ok(())
+        }
+        "status" => {
+            // `Response.Status = "301 Moved Permanently"` or `"404"`.
+            let text = prop(env)?;
+            let mut parts = text.splitn(2, ' ');
+            let code = parts
+                .next()
+                .and_then(|c| c.trim().parse::<u16>().ok())
+                .ok_or_else(|| rt_error(1, format!("invalid Response.Status '{text}'")))?;
+            env.response.status = Some(code);
+            env.response.status_text = parts.next().map(|t| t.to_string());
+            Ok(())
+        }
+        "contenttype" => {
+            env.response.content_type = Some(prop(env)?);
+            Ok(())
+        }
+        "charset" => {
+            env.response.charset = Some(prop(env)?);
+            Ok(())
+        }
+        "expires" => {
+            // Minutes until expiry -> Cache-Control max-age + Expires.
+            let minutes = match args {
+                [a] => eval_expr(a, env)?.as_number(1)?,
+                _ => return Err(rt_error(1, "Response.Expires requires a number of minutes")),
+            };
+            let secs = (minutes.max(0.0) * 60.0) as i64;
+            env.response
+                .set_header("cache-control", &format!("max-age={secs}"));
+            Ok(())
+        }
+        "expiresabsolute" => {
+            // Accept a date/time value; rendered into an Expires header.
+            let when = match args {
+                [a] => eval_expr(a, env)?.display(),
+                _ => return Err(rt_error(1, "Response.ExpiresAbsolute requires a date")),
+            };
+            env.response.set_header("expires", &when);
+            Ok(())
+        }
+        "cachecontrol" => {
+            let value = prop(env)?;
+            env.response.set_header("cache-control", &value);
+            Ok(())
+        }
+        "addheader" => {
+            let (name, value) = match args {
+                [n, v] => (eval_expr(n, env)?.display(), eval_expr(v, env)?.display()),
+                _ => return Err(rt_error(1, "Response.AddHeader requires name and value")),
+            };
+            env.response.set_header(&name, &value);
+            Ok(())
+        }
+        "appendtolog" => {
+            // No log sink yet; accept and evaluate for side-effect shape.
+            for a in args {
+                let _ = eval_expr(a, env)?;
             }
             Ok(())
+        }
+        "binarywrite" | "cookies" => {
+            // BinaryWrite needs Byte support (variant-semantics work);
+            // the Cookies collection write form arrives with sessions.
+            Err(unimplemented(1, format!("Response.{verb}")))
         }
         other => Err(unimplemented(1, format!("Response.{other}"))),
     }

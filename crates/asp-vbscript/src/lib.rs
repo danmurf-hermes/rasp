@@ -5,7 +5,7 @@ pub mod lexer;
 pub mod parser;
 pub mod vb_datetime;
 
-pub use eval::{ExecEnv, ResponseBuffer, exec_block, exec_block_loops};
+pub use eval::{Cookie, ExecEnv, ResponseBuffer, exec_block, exec_block_loops};
 pub use lexer::Tok;
 pub use parser::{Expr, Stmt, Variant, parse_block};
 
