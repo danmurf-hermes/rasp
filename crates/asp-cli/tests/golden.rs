@@ -38,6 +38,7 @@ fn get(path: &str, query: &str) -> (HttpResponseLike, String) {
         query: query.to_string(),
         form: String::new(),
         cookies: String::new(),
+        headers: Vec::new(),
     };
     let response = handle_request(&app(), &root_relative, &request);
     (
@@ -159,6 +160,7 @@ fn golden_querystring_page() {
         query: "who=Dan".to_string(),
         form: String::new(),
         cookies: String::new(),
+        headers: Vec::new(),
     };
     let root_relative = resolve_request_path(&app(), &config, "/q.asp");
     let response = handle_request(&app(), &root_relative, &request);

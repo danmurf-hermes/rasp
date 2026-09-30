@@ -127,14 +127,10 @@ fn assemble_from_source(
 fn parse_expr_standalone(expression: &str, line: usize) -> AspResult<asp_vbscript::Expr> {
     let src = format!("response.write {expression}");
     match parse_block(&src, line)?.as_slice() {
-        [
-            asp_vbscript::Stmt::ResponseCall {
-                arg: Some(expr), ..
-            },
-        ] => Ok(expr.clone()),
-        [asp_vbscript::Stmt::ResponseCall { arg: None, .. }] => Err(AspError::Syntax(
-            Diagnostic::new(line, "<%= %> requires an expression"),
-        )),
+        [asp_vbscript::Stmt::ResponseCall { args, .. }] if args.len() == 1 => Ok(args[0].clone()),
+        [asp_vbscript::Stmt::ResponseCall { args, .. }] if args.is_empty() => Err(
+            AspError::Syntax(Diagnostic::new(line, "<%= %> requires an expression")),
+        ),
         other => Err(AspError::Syntax(Diagnostic::new(
             line,
             format!(
@@ -150,7 +146,15 @@ fn parse_expr_standalone(expression: &str, line: usize) -> AspResult<asp_vbscrip
 pub struct RenderOutput {
     pub body: String,
     pub status: Option<u16>,
+    pub status_text: Option<String>,
     pub content_type: Option<String>,
+    pub charset: Option<String>,
+    /// Extra headers in insertion order (`AddHeader`, `Expires`, …).
+    pub headers: Vec<(String, String)>,
+    /// Outbound cookies (`Response.Cookies("k") = v`).
+    pub cookies: Vec<asp_vbscript::Cookie>,
+    /// `Response.Redirect target` set on this render.
+    pub redirect: Option<String>,
 }
 
 /// Render an assembled page end to end against a base environment.
@@ -161,7 +165,7 @@ pub struct RenderOutput {
 /// block can close its `Next` in a later block with the page's HTML
 /// re-emitted on every iteration, exactly as Classic ASP behaves.
 pub fn render_assembled(assembled: &AssembledPage, base_env: &ExecEnv) -> AspResult<RenderOutput> {
-    // ExecEnv is request-scoped; M1 starts each page from the parsed
+    // ExecEnv is request-scoped; each page starts from the parsed
     // request data rather than inheriting mutable state.
     let mut env = fresh_env(base_env);
     let mut out = RenderOutput::default();
@@ -169,7 +173,12 @@ pub fn render_assembled(assembled: &AssembledPage, base_env: &ExecEnv) -> AspRes
     asp_vbscript::exec_block_loops(&stmts, &mut env)?;
     out.body = env.response.body();
     out.status = env.response.status;
+    out.status_text = env.response.status_text.clone();
     out.content_type = env.response.content_type.clone();
+    out.charset = env.response.charset.clone();
+    out.headers = env.response.headers.clone();
+    out.cookies = env.response.cookies.clone();
+    out.redirect = env.response.redirect.clone();
     Ok(out)
 }
 
@@ -190,9 +199,9 @@ fn flatten_steps(steps: &[RenderStep]) -> AspResult<Vec<asp_vbscript::Stmt>> {
                 }
                 stmts.push(Stmt::ResponseCall {
                     verb: "write".to_string(),
-                    arg: Some(asp_vbscript::Expr::Literal(asp_vbscript::Variant::Str(
+                    args: vec![asp_vbscript::Expr::Literal(asp_vbscript::Variant::Str(
                         text.clone(),
-                    ))),
+                    ))],
                 });
             }
             RenderStep::Script(block_stmts) => {
@@ -201,7 +210,7 @@ fn flatten_steps(steps: &[RenderStep]) -> AspResult<Vec<asp_vbscript::Stmt>> {
             RenderStep::Output(expr) => {
                 stmts.push(Stmt::ResponseCall {
                     verb: "write".to_string(),
-                    arg: Some(expr.clone()),
+                    args: vec![expr.clone()],
                 });
             }
         }
@@ -217,6 +226,7 @@ fn fresh_env(base: &ExecEnv) -> ExecEnv {
     // values themselves are carried through for the same request.
     env.session = base.session.clone();
     env.request_data = base.request_data.clone();
+    env.server_variables = base.server_variables.clone();
     env
 }
 
@@ -246,14 +256,27 @@ pub fn url_decode(input: &str) -> String {
 }
 
 /// Top-level render of a page by path: read, parse, assemble, execute.
+/// `server_variables` feeds `Request.ServerVariables`.
 pub fn render_page(
     app: &AppRoot,
     root_relative: &str,
     request_data: HashMap<String, String>,
 ) -> AspResult<RenderOutput> {
+    render_page_with(app, root_relative, request_data, HashMap::new())
+}
+
+/// Same as [`render_page`] with server variables supplied.
+pub fn render_page_with(
+    app: &AppRoot,
+    root_relative: &str,
+    request_data: HashMap<String, String>,
+    server_variables: HashMap<String, String>,
+) -> AspResult<RenderOutput> {
     let mut seen = Vec::new();
     let assembled = assemble(app, root_relative, &mut seen)?;
-    let base = ExecEnv::new().with_request_data(request_data);
+    let base = ExecEnv::new()
+        .with_request_data(request_data)
+        .with_server_variables(server_variables);
     render_assembled(&assembled, &base)
 }
 
@@ -411,7 +434,7 @@ mod tests {
         match asp_vbscript::exec_block(
             &[asp_vbscript::Stmt::ResponseCall {
                 verb: "write".to_string(),
-                arg: Some(expr),
+                args: vec![expr],
             }],
             &mut env,
         ) {

@@ -1,15 +1,24 @@
 //! HTTP server and request-to-response integration for RASP.
 //!
-//! M1 wraps `tiny_http` with the ASP request pipeline: parse the request
-//! URL, decode query/form/cookies into `Request` data, render the page
-//! through `asp-runtime`, and emit status + body. Static assets are not
-//! served in M1 — only `.asp` pages.
+//! M3 wraps `tiny_http` with the full ASP request pipeline: parse the
+//! request URL, decode query/form/cookies into `Request` data, populate
+//! `Request.ServerVariables` from the real request, render the page
+//! through `asp-runtime`, and emit status + headers + cookies + body.
+//! Requests enforce a body-size limit and a URL-length limit. Runaway
+//! pages are bounded by the interpreter's loop/recursion caps. Static
+//! assets are not served — only `.asp` pages.
 
 use asp_core::AppRoot;
-use asp_runtime::{RenderOutput, build_request_data, render_page};
+use asp_runtime::{RenderOutput, build_request_data, render_page_with};
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
+
+/// Maximum accepted request body (form posts), bytes.
+const MAX_BODY_BYTES: usize = 1_048_576;
+
+/// Maximum accepted request-URL length, bytes.
+const MAX_URL_LENGTH: usize = 2048;
 
 /// Server configuration for one application host.
 #[derive(Debug, Clone)]
@@ -20,6 +29,9 @@ pub struct ServerConfig {
     pub port: u16,
     /// Default document when a path resolves to a directory.
     pub default_document: String,
+    /// Development mode: error pages carry full diagnostics.
+    /// Production returns a generic 500 without internal detail.
+    pub dev_errors: bool,
 }
 
 impl Default for ServerConfig {
@@ -28,6 +40,7 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 8174,
             default_document: "default.asp".to_string(),
+            dev_errors: true,
         }
     }
 }
@@ -41,12 +54,31 @@ pub struct HttpRequest {
     pub query: String,
     pub form: String,
     pub cookies: String,
+    /// Raw request headers (lower-cased names) for ServerVariables.
+    pub headers: Vec<(String, String)>,
 }
 
 impl HttpRequest {
     /// Combine the request's collections into the runtime's key map.
     pub fn request_data(&self) -> HashMap<String, String> {
         build_request_data(&self.query, &self.form, &self.cookies)
+    }
+
+    /// `Request.ServerVariables` values. Keys are stored lowercase so
+    /// the evaluator's case-insensitive lookups find them (IIS names
+    /// like `REQUEST_METHOD` are accepted in any case from pages).
+    pub fn server_variables(&self) -> HashMap<String, String> {
+        let mut vars = HashMap::new();
+        vars.insert("request_method".to_string(), self.method.clone());
+        vars.insert("script_name".to_string(), self.path.clone());
+        vars.insert("query_string".to_string(), self.query.clone());
+        vars.insert("http_cookie".to_string(), self.cookies.clone());
+        vars.insert("http_method".to_string(), self.method.clone());
+        for (name, value) in &self.headers {
+            let lower = format!("http_{}", name.to_ascii_lowercase().replace('-', "_"));
+            vars.insert(lower, value.clone());
+        }
+        vars
     }
 }
 
@@ -56,10 +88,26 @@ pub struct HttpResponse {
     pub status: u16,
     pub body: String,
     pub content_type: String,
+    /// Extra headers in emission order (Content-Type excluded).
+    pub headers: Vec<(String, String)>,
+    /// Outbound Set-Cookie headers.
+    pub set_cookies: Vec<String>,
+}
+
+impl HttpResponse {
+    fn new(status: u16, body: String, content_type: String) -> Self {
+        Self {
+            status,
+            body,
+            content_type,
+            headers: Vec::new(),
+            set_cookies: Vec::new(),
+        }
+    }
 }
 
 /// Map a URL path to a page inside `app`, enforcing the default
-/// document and the `.asp`-only rule for M1.
+/// document and the `.asp`-only rule.
 pub fn resolve_request_path(app: &AppRoot, config: &ServerConfig, path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
     let mut root_relative = if trimmed.is_empty() {
@@ -80,46 +128,96 @@ pub fn resolve_request_path(app: &AppRoot, config: &ServerConfig, path: &str) ->
 }
 
 /// Render one request into an HTTP response without a server socket
-/// (the integration point used by tests and the `run` CLI).
+/// (the integration point used by tests and the `run` CLI). Error
+/// bodies carry full diagnostics (development mode).
 pub fn handle_request(app: &AppRoot, root_relative: &str, request: &HttpRequest) -> HttpResponse {
-    match try_render(app, root_relative, request) {
-        Ok(out) => to_response(out),
-        Err(asp_core::AspError::PageNotFound(_)) => HttpResponse {
-            status: 404,
-            body: "<html><body><h1>404 Not Found</h1></body></html>\n".to_string(),
-            content_type: "text/html".to_string(),
-        },
-        Err(err) => error_response(500, &err.to_string()),
-    }
+    handle_request_for_server(app, root_relative, request, true)
 }
 
-fn try_render(
+/// Render one request for the server. With `dev_errors` off, render
+/// failures return a generic 500 with no internal detail (production).
+///
+/// Runaway pages are stopped by the interpreter's own caps
+/// (`MAX_LOOP_ITERATIONS`, `MAX_CALL_DEPTH`) — they surface as 500s,
+/// not hangs; a wall-clock deadline cannot interrupt an in-flight
+/// tree-walk anyway.
+pub fn handle_request_for_server(
     app: &AppRoot,
     root_relative: &str,
     request: &HttpRequest,
-) -> asp_core::AspResult<RenderOutput> {
-    let out = render_page(app, root_relative, request.request_data())?;
-    Ok(out)
+    dev_errors: bool,
+) -> HttpResponse {
+    // URL-length guard mirrors the server's pre-render limit.
+    if request.path.len() + request.query.len() > MAX_URL_LENGTH {
+        return error_page(414, "URI Too Long", None);
+    }
+    let mut vars = request.server_variables();
+    // IIS reports SCRIPT_NAME as the executing script (after default
+    // document resolution), not the raw URL path.
+    vars.insert("script_name".to_string(), format!("/{root_relative}"));
+    match render_page_with(app, root_relative, request.request_data(), vars) {
+        Ok(out) => to_response(out),
+        Err(asp_core::AspError::PageNotFound(_)) => error_page(404, "Not Found", None),
+        Err(err) => {
+            // Production: generic page, no internal detail. Dev: the
+            // full diagnostic in a <pre> block.
+            if dev_errors {
+                error_page(500, "Server error", Some(err.to_string()))
+            } else {
+                error_page(500, "Server error", None)
+            }
+        }
+    }
 }
 
 fn to_response(out: RenderOutput) -> HttpResponse {
-    HttpResponse {
-        status: out.status.unwrap_or(200),
-        body: out.body,
-        content_type: out.content_type.unwrap_or_else(|| "text/html".to_string()),
+    // Redirects: Classic ASP sends a 302 with a Location header and an
+    // object-moved body; the buffered body is discarded.
+    if let Some(target) = out.redirect {
+        let mut response = HttpResponse::new(
+            302,
+            format!(
+                "<html><body><p>Object moved</p><p><a href=\"{target}\">here</a>.</p></body></html>"
+            ),
+            "text/html".to_string(),
+        );
+        response.headers.push(("Location".to_string(), target));
+        return response;
     }
+    let mut response = HttpResponse::new(
+        out.status.unwrap_or(200),
+        out.body,
+        out.content_type
+            .clone()
+            .unwrap_or_else(|| "text/html".to_string()),
+    );
+    if let Some(charset) = out.charset {
+        response.content_type = format!("{}; charset={}", response.content_type, charset);
+    }
+    if let Some(text) = out.status_text {
+        response
+            .headers
+            .push(("X-Rasp-Status-Text".to_string(), text));
+    }
+    response.headers.extend(out.headers);
+    for cookie in &out.cookies {
+        response
+            .set_cookies
+            .push(format!("{}={}", cookie.name, cookie.value));
+    }
+    response
 }
 
-fn error_response(status: u16, message: &str) -> HttpResponse {
-    let body = format!(
-        "<html><body><h1>RASP error</h1><pre>{}</pre></body></html>\n",
-        html_escape(message)
-    );
-    HttpResponse {
-        status,
-        body,
-        content_type: "text/html".to_string(),
-    }
+/// Error body: a heading plus optional dev-only diagnostic detail.
+fn error_page(status: u16, heading: &str, detail: Option<String>) -> HttpResponse {
+    let body = match detail {
+        Some(message) => format!(
+            "<html><body><h1>{heading}</h1><pre>{}</pre></body></html>\n",
+            html_escape(&message)
+        ),
+        None => format!("<html><body><h1>{heading}</h1></body></html>\n"),
+    };
+    HttpResponse::new(status, body, "text/html".to_string())
 }
 
 fn html_escape(s: &str) -> String {
@@ -144,31 +242,58 @@ pub fn serve(app: &AppRoot, config: &ServerConfig) -> asp_core::AspResult<()> {
             }
         };
         let config = config.clone();
-        // M1 is sequential: correctness over concurrency (tokio/threads in M2).
         let method = request.method().to_string();
         let url = request.url().to_string();
+        if url.len() > MAX_URL_LENGTH {
+            let _ = request.respond(tiny_response(error_page(414, "URI Too Long", None)));
+            continue;
+        }
         let (path, query) = split_url(&url);
-        let cookies = header_value(&request_headers(&request), "cookie");
-        let form = read_form(&mut request);
+        let headers = request_headers(&request);
+        let cookies = header_value(&headers, "cookie");
+        let form_result = read_form(&mut request);
+        let form = match form_result {
+            Ok(f) => f,
+            Err(message) => {
+                let _ = request.respond(tiny_response(error_page(413, &message, None)));
+                continue;
+            }
+        };
         let http_request = HttpRequest {
             method,
             path,
             query,
             form,
             cookies,
+            headers,
         };
         let root_relative = resolve_request_path(app, &config, &http_request.path);
-        let response = handle_request(app, &root_relative, &http_request);
-        let header =
-            tiny_http::Header::from_bytes(&b"Content-Type"[..], response.content_type.as_bytes())
-                .unwrap_or_else(|_| {
-                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap()
-                });
-        let mut http_response = tiny_http::Response::from_data(response.body.into_bytes())
-            .with_status_code(response.status);
-        http_response.add_header(header);
-        let _ = request.respond(http_response);
+        let response =
+            handle_request_for_server(app, &root_relative, &http_request, config.dev_errors);
+        let _ = request.respond(tiny_response(response));
     }
+}
+
+fn tiny_response(response: HttpResponse) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    let mut out = tiny_http::Response::from_data(response.body.into_bytes())
+        .with_status_code(response.status);
+    let content_type =
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], response.content_type.as_bytes())
+            .unwrap_or_else(|_| {
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap()
+            });
+    out.add_header(content_type);
+    for (name, value) in &response.headers {
+        if let Ok(h) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            out.add_header(h);
+        }
+    }
+    for cookie in &response.set_cookies {
+        if let Ok(h) = tiny_http::Header::from_bytes(&b"Set-Cookie"[..], cookie.as_bytes()) {
+            out.add_header(h);
+        }
+    }
+    out
 }
 
 fn split_url(url: &str) -> (String, String) {
@@ -199,14 +324,22 @@ fn header_value(headers: &[(String, String)], name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Read the request body as a form string (`k=v&k2=v2`), up to a limit.
-fn read_form(request: &mut tiny_http::Request) -> String {
-    let mut body = String::new();
-    let length = request.body_length().unwrap_or(0).min(1_048_576) as u64;
-    if length > 0 {
-        let _ = request.as_reader().take(length).read_to_string(&mut body);
+/// Read the request body as a form string (`k=v&k2=v2`), up to the
+/// body limit; oversize bodies are a 413.
+fn read_form(request: &mut tiny_http::Request) -> Result<String, String> {
+    let length = request.body_length().unwrap_or(0);
+    if length > MAX_BODY_BYTES {
+        return Err("request body too large".to_string());
     }
-    body
+    let mut body = String::new();
+    if length > 0 {
+        let _ = request
+            .as_reader()
+            .take(length as u64)
+            .read_to_string(&mut body)
+            .map_err(|e| format!("cannot read request body: {e}"))?;
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -231,6 +364,7 @@ mod tests {
             query: query.to_string(),
             form: String::new(),
             cookies: String::new(),
+            headers: Vec::new(),
         }
     }
 
@@ -291,5 +425,138 @@ mod tests {
     #[test]
     fn url_decoder_round_trip() {
         assert_eq!(asp_runtime::url_decode("a+b%21"), "a b!");
+    }
+
+    #[test]
+    fn form_data_flows_through() {
+        let root = build_app("form");
+        fs::write(
+            root.join("f.asp"),
+            "<%= Request.Form(\"user\") & \"/\" & Request.QueryString(\"x\") %>",
+        )
+        .unwrap();
+        let app = AppRoot::new(&root);
+        let config = ServerConfig::default();
+        let rel = resolve_request_path(&app, &config, "/f.asp");
+        let mut req = request("/f.asp", "x=9");
+        req.method = "POST".to_string();
+        req.form = "user=dan".to_string();
+        let response = handle_request(&app, &rel, &req);
+        assert_eq!(response.body, "dan/9");
+    }
+
+    #[test]
+    fn cookies_flows_through() {
+        let root = build_app("cookie");
+        fs::write(root.join("c.asp"), "<%= Request.Cookies(\"sid\") %>").unwrap();
+        let app = AppRoot::new(&root);
+        let config = ServerConfig::default();
+        let rel = resolve_request_path(&app, &config, "/c.asp");
+        let mut req = request("/c.asp", "");
+        req.cookies = "sid=abc123".to_string();
+        let response = handle_request(&app, &rel, &req);
+        assert_eq!(response.body, "abc123");
+    }
+
+    #[test]
+    fn server_variables_expose_method_and_path() {
+        let root = build_app("sv");
+        fs::write(
+            root.join("s.asp"),
+            "<%= Request.ServerVariables(\"REQUEST_METHOD\") & \":\" & Request.ServerVariables(\"SCRIPT_NAME\") %>",
+        )
+        .unwrap();
+        let app = AppRoot::new(&root);
+        let config = ServerConfig::default();
+        let rel = resolve_request_path(&app, &config, "/s.asp");
+        let mut req = request("/s.asp", "");
+        req.method = "PUT".to_string();
+        let response = handle_request(&app, &rel, &req);
+        assert_eq!(response.body, "PUT:/s.asp");
+    }
+
+    #[test]
+    fn redirect_sets_302_and_location() {
+        let root = build_app("redir");
+        fs::write(
+            root.join("r.asp"),
+            "<% Response.Redirect \"/target.asp\" %>never",
+        )
+        .unwrap();
+        let app = AppRoot::new(&root);
+        let config = ServerConfig::default();
+        let rel = resolve_request_path(&app, &config, "/r.asp");
+        let response = handle_request(&app, &rel, &request("/r.asp", ""));
+        assert_eq!(response.status, 302);
+        assert!(
+            response
+                .headers
+                .contains(&("Location".to_string(), "/target.asp".to_string()))
+        );
+        assert!(!response.body.contains("never"));
+    }
+
+    #[test]
+    fn status_and_content_type_and_headers() {
+        let root = build_app("resp");
+        fs::write(
+            root.join("p.asp"),
+            "<% Response.Status = \"404 Not Found\"\nResponse.ContentType = \"text/plain\"\nResponse.AddHeader \"X-Flag\", \"on\"\nResponse.Charset = \"utf-8\"\n%>body",
+        )
+        .unwrap();
+        let app = AppRoot::new(&root);
+        let config = ServerConfig::default();
+        let rel = resolve_request_path(&app, &config, "/p.asp");
+        let response = handle_request(&app, &rel, &request("/p.asp", ""));
+        assert_eq!(response.status, 404);
+        assert_eq!(response.content_type, "text/plain; charset=utf-8");
+        assert!(
+            response
+                .headers
+                .contains(&("X-Flag".to_string(), "on".to_string()))
+        );
+        assert_eq!(response.body, "body");
+    }
+
+    #[test]
+    fn cookies_are_set_on_response() {
+        let root = build_app("set-cookie");
+        fs::write(
+            root.join("sc.asp"),
+            "<% Response.Cookies(\"pref\") = \"dark\" %><%= Request.QueryString(\"x\") %>",
+        )
+        .unwrap();
+        let app = AppRoot::new(&root);
+        let config = ServerConfig::default();
+        let rel = resolve_request_path(&app, &config, "/sc.asp");
+        let response = handle_request(&app, &rel, &request("/sc.asp", "x=1"));
+        assert_eq!(response.set_cookies, vec!["pref=dark".to_string()]);
+        assert_eq!(response.body, "1");
+    }
+
+    #[test]
+    fn oversize_url_is_414() {
+        let app = AppRoot::new(build_app("414"));
+        let long = format!("/hello.asp?{}", "a=1&".repeat(2000));
+        let config = ServerConfig::default();
+        let rel = resolve_request_path(&app, &config, &long);
+        let response = handle_request(&app, &rel, &request(&long, ""));
+        assert_eq!(response.status, 414);
+    }
+
+    #[test]
+    fn production_errors_hide_detail() {
+        let root = build_app("prod");
+        fs::write(root.join("x.asp"), "<%= 1 / 0 %>").unwrap();
+        let app = AppRoot::new(&root);
+        let config = ServerConfig::default();
+        let rel = resolve_request_path(&app, &config, "/x.asp");
+        let response = handle_request_for_server(&app, &rel, &request("/x.asp", ""), false);
+        assert_eq!(response.status, 500);
+        assert!(!response.body.contains("division by zero"));
+        assert!(response.body.contains("Server error"));
+        // Dev mode shows the diagnostic instead.
+        let dev = handle_request_for_server(&app, &rel, &request("/x.asp", ""), true);
+        assert!(dev.body.contains("division by zero"));
     }
 }
