@@ -26,10 +26,6 @@ impl Block {
     }
 }
 
-/// Marker alias kept from earlier drafts; new code should use [`Block`].
-#[allow(dead_code)]
-pub type InlineBlock = Block;
-
 /// The script language a page asked for, or the default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LanguageSetting {
@@ -64,15 +60,6 @@ struct Parser<'s> {
     line: usize,
     blocks: Vec<Block>,
     language: Option<LanguageSetting>,
-}
-
-/// Result of consuming one markup-delimited region.
-#[allow(dead_code)]
-enum Region {
-    /// A complete block was pushed.
-    Block,
-    /// A `@` directive was consumed.
-    AtDirective,
 }
 
 impl<'s> Parser<'s> {
@@ -115,7 +102,7 @@ impl<'s> Parser<'s> {
                 match parse_include(comment, self.line)? {
                     Some(path) => {
                         self.push_text(text_start, i);
-                        self.blocks.push(InlineBlock::Include { path });
+                        self.blocks.push(Block::Include { path });
                         i = end + 3;
                         text_start = i;
                         continue;
@@ -226,7 +213,7 @@ impl<'s> Parser<'s> {
             return None;
         }
         for i in from..=self.bytes.len() - 3 {
-            if &self.bytes[i..i + 3] == b"--\x3e" {
+            if &self.bytes[i..i + 3] == b"-->" {
                 return Some(i);
             }
         }

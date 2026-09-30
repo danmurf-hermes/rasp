@@ -1,0 +1,34 @@
+# Agent guide
+
+Classic ASP interpreter in Rust. Keep changes small; one milestone per PR.
+
+## Gates (run before every push, in order)
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
+cargo test --all
+```
+
+## Plan discipline
+
+- `docs/asp-classic-interpreter-plan.md` is the contract: every PR updates its status rows, workstream sections, and next steps in the same PR.
+- Mark **Built** only when tested and documented; unsupported constructs raise clear "not supported in milestone N" diagnostics.
+
+## Rust conventions
+
+- Edition 2024; let chains available. No `#[allow(dead_code)]` or stub pub items for future milestones — add code when its milestone lands.
+- One type alias, not two; no "marker alias kept from earlier drafts".
+- Error paths use `AspError` variants with `Diagnostic`; never panic on user input.
+- Parse once: don't call `Page::parse` / `parse_block` for validation and then again for use.
+- Use plain text in byte/string literals (`b"-->"`, not escapes like `\x3e`).
+- Golden tests assert exact bodies/statuses; explain any golden diff before updating fixtures.
+- Keep path confinement (`fs::confined_join`) and include-cycle detection intact — they are security gates, not polish.
+
+## Architecture invariants
+
+- Cross-block loops flatten into one statement stream via `flatten_steps`; `exec_block` deliberately errors on loop openers.
+- Loop openers (`ForLoopOpen`, `DoOpen`) are separate `Stmt` variants; the executor pairs `Next`/`Loop` with the innermost opener.
+- `Response.Write <expr>` takes a full expression; a leading `(` is a parenthesised operand.
+- Statements separate on `Tok::LineEnd`; `consume_loop_tail` eats only the optional `Next i` name, never `While`/`Until`/`Loop`/`For`.
+- Ordinary HTML comments pass through; only `<!-- #include ... -->` is consumed.

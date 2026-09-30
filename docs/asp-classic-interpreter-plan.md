@@ -195,7 +195,7 @@ Any status change should be accompanied by a short note in the relevant section 
 | Area | Status | Current notes |
 |---|---|---|
 | Project scaffolding | Built | Cargo workspace, five focused crates, placeholder `rasp` CLI (`version` works), README quick start. |
-| Cargo workspace and CI | Built | GitHub Actions quality job (fmt, clippy, test on Ubuntu and macOS) plus a Docker build/run smoke test. |
+| Cargo workspace and CI | Built | GitHub Actions quality job (fmt, clippy, test on Ubuntu and macOS) plus a Docker build/run smoke test. `AGENTS.md` records the gate commands and architecture invariants for future agents. |
 | ASP page parser | Built | Text, `<% %>`, `<%= %>`, `<%@ Language %>`, and `<!-- #include -->` directives parsed per page; ordinary comments pass through. |
 | Include resolution | Built | `file` resolves against the containing page's directory, `virtual` against the app root; path-confinement checks, 32-depth cycle detection. |
 | VBScript lexer | Built | Case-insensitive keywords, strings with `""` escapes, `'` comments, `_` continuations, hex/octal literals, statement line-end tracking. |
@@ -976,4 +976,4 @@ This checklist applies before every pull request is marked ready for review.
 1. Milestone 2 — core language subset: arrays, procedures (`Sub`/`Function`/`Call`), conversions, `Date`/`Time` functions, and `Exit For`/`Exit Do`.
 2. Golden tests for each new language feature as it lands.
 3. Milestone 3 prep: finish the Response model (`Redirect`, `ContentType`, cookies) and request timeouts/size limits.
-4. Keep this plan updated as each milestone becomes real.
+4. Keep `AGENTS.md` in step with new conventions as they emerge.

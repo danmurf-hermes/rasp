@@ -53,8 +53,7 @@ pub fn assemble(
     assemble_from_source(app, &page, parent_dir.as_deref(), root_relative, seen)
 }
 
-/// Assemble from an already-parsed page (unit-test entry point).
-pub fn assemble_from_source(
+fn assemble_from_source(
     app: &AppRoot,
     page: &Page,
     parent_dir: Option<&std::path::Path>,
@@ -81,8 +80,6 @@ pub fn assemble_from_source(
         match block {
             Block::Text(text) => steps.push(RenderStep::Text(text.clone())),
             Block::Script { body } => {
-                let stmts = parse_block(body, 1)?;
-                let _ = stmts.len();
                 steps.push(RenderStep::Script(parse_block(body, 1)?));
             }
             Block::Output { expression } => {
@@ -248,22 +245,6 @@ pub fn url_decode(input: &str) -> String {
         .into_owned()
 }
 
-/// URL-encode for redirects / cookies (used by M3+; kept alongside
-/// `url_decode` for symmetry).
-#[allow(dead_code)]
-pub fn url_encode(input: &str) -> String {
-    let mut out = String::new();
-    for b in input.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 /// Top-level render of a page by path: read, parse, assemble, execute.
 pub fn render_page(
     app: &AppRoot,
@@ -403,7 +384,6 @@ mod tests {
     fn url_decode_handles_escapes_and_plus() {
         assert_eq!(url_decode("a%20b+c"), "a b c");
         assert_eq!(url_decode("100%25"), "100%");
-        assert_eq!(url_encode("a b"), "a%20b");
     }
 
     #[test]
