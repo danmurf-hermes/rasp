@@ -81,7 +81,41 @@ fn golden_loop_page() {
     assert_eq!(response.status, 200);
     assert_eq!(
         response.body,
-        "\n<span></span><span>1</span><span>2</span><span>3</span>"
+        // The M2 executor no longer runs the body once before the
+        // first iteration (an M1 stack-machine artifact that emitted a
+        // spurious empty span; real VBScript never does this).
+        "\n<span>1</span><span>2</span><span>3</span>"
+    );
+}
+
+#[test]
+fn golden_arrays_page() {
+    let (response, _) = get("/arrays.asp", "");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.body,
+        "\n\n<ul>\n<li>ann: 10</li><li>bob: 20</li><li>cid: 30</li>\n</ul>\n"
+    );
+}
+
+#[test]
+fn golden_procedures_page() {
+    let (response, _) = get("/procs.asp", "");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.body,
+        "\n\n<p>Hello, Dan!</p>\n<p>high (150)</p>\n<p>score 42</p>\n<p>2</p>"
+    );
+}
+
+#[test]
+fn golden_exit_and_conversions_page() {
+    let (response, _) = get("/exit.asp", "");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.body,
+        "\n\n<p>loop1=123</p>\n<p>loop2=3</p>\n<p>round=24</p>\n\
+         <p>date=2026-9-30</p>\n<p>eom=2026-03-01</p>"
     );
 }
 

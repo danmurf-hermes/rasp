@@ -199,9 +199,9 @@ Any status change should be accompanied by a short note in the relevant section 
 | ASP page parser | Built | Text, `<% %>`, `<%= %>`, `<%@ Language %>`, and `<!-- #include -->` directives parsed per page; ordinary comments pass through. |
 | Include resolution | Built | `file` resolves against the containing page's directory, `virtual` against the app root; path-confinement checks, 32-depth cycle detection. |
 | VBScript lexer | Built | Case-insensitive keywords, strings with `""` escapes, `'` comments, `_` continuations, hex/octal literals, statement line-end tracking. |
-| VBScript parser and AST | Built | Expressions with full precedence, Dim/Const, assignment, If/ElseIf/Else (block and single-line), For/Next and Do/Loop (deferred openers for cross-block bodies), Response/Request/Session targets. |
-| VBScript evaluator | Built | Deterministic tree-walking evaluator: variables, arithmetic, `&` concat, loops with iteration caps, builtins (Len/UCase/Left/Mid/InStr/CStr/...), per-request `ExecEnv` + buffered Response. |
-| Variant/value semantics | Not started | Needs careful coercion and equality rules. |
+| VBScript parser and AST | Built | Expressions with full precedence, Dim (with array sizes), Const, assignment (incl. indexed stores), If/ElseIf/Else (block and single-line), Sub/Function declarations, Call, deferred loop openers/closers and procedure delimiters for cross-block bodies. |
+| VBScript evaluator | Built | Nested-correct tree-walking evaluator: normalization pass pairs deferred delimiters and hoists procedures (callable before definition), variables with procedure-local frames, ByRef/ByVal parameters, arrays (fixed-size + `Array()`), loops with iteration caps, recursion cap, Exit For/Do/Sub/Function, builtins (strings, conversions with banker's rounding, Date/Time family), per-request `ExecEnv` + buffered Response. |
+| Variant/value semantics | Partial | `Empty`/`Null`/`Bool`/`Int`/`Float`/`Str`/`Date`/`Array` with documented coercion rules (strings parse as dates before numbers); multi-dimensional arrays and `Byte`/binary data still to come. |
 | ASP intrinsic objects | In progress | `Response.Write/End/Clear` and the buffer passthrough work; `Request.QueryString` reads query/form/cookie data; Response controls (Redirect, ContentType, cookies) parse but their effects land in M3. |
 | Request lifecycle | In progress | Output buffers per request and ends early on `Response.End`; errors produce diagnostic pages/500s; timeouts and size limits still to come. |
 | Session state | Not started | Begin with signed cookie + in-process store; add Redis later if needed. |
@@ -298,7 +298,7 @@ Current state:
 
 ### 7.3 VBScript language engine
 
-**Status:** In progress
+**Status:** Built (Phases 1–2; Phase 3+ pending)
 
 This is the largest workstream. Build in phases rather than attempting a complete parser immediately.
 
@@ -351,6 +351,45 @@ Compatibility notes:
 - Statements are usually line-oriented.
 - Implicit conversion semantics are central and must be tested extensively.
 - `ByRef` behavior matters and should not be guessed.
+
+#### Implementation state after Milestone 2
+
+Current state (all tested via crate unit tests plus end-to-end goldens
+in `examples/hello-app/{arrays,procs,exit}.asp`):
+
+- **Phase 1 entirely built** — variables, operators, `If`, `For`/`Next`
+  (nested correctly; bodies may interleave markup across `<% %>`
+  blocks), `Do ... Loop` with leading/trailing conditions, `Dim`,
+  `Const`, procedure calls, `Response.Write`.
+- **Phase 2 built** — fixed-size arrays (`Dim a(3)`, indexes 0..=3,
+  bounds-checked), `a(i)` reads and stores, the `Array()` literal,
+  `UBound`/`LBound`, `Split`, `Join`; `Sub`/`Function` with parameter
+  lists, `Call` (ByRef preserved through Call's parens; bare `f (x)`
+  is ByVal, matching VBScript), ByRef write-back to caller variables,
+  hoisting so procedures are callable before their textual definition,
+  `Exit For`/`Exit Do`/`Exit Sub`/`Exit Function`; `CStr`/`CInt`/
+  `CLng`/`CDbl`/`CBool` (CInt/CLng use VBScript banker's rounding and
+  range errors), `IsEmpty`/`IsNull`/`IsNumeric`/`IsArray`/`IsDate`.
+- **Extras beyond the phase list** — `Variant::Date` values with an
+  invariant documented format set (`vb_datetime.rs`: ISO, US
+  `M/D/YYYY`, 12/24-hour times, two-digit-year windowing), and the
+  Date/Time family (`DateSerial`, `DateAdd`, `DateDiff`, `DateValue`,
+  `TimeValue`, `Year`/`Month`/`Day`/`Hour`/`Minute`/`Second`/`Weekday`,
+  `Now`/`Date`/`Time`/`Timer`); string helpers (`StrReverse`, `Space`,
+  `String`, `Replace`).
+- **Executor architecture** — the parser still emits deferred
+  delimiters (`ForLoopOpen`/`Next`, `DoOpen`/`LoopClose`/`DoClose`,
+  `ProcOpen`/`ProcClose`); a normalization pass in `exec_block_loops`
+  pairs them (rejecting mismatched closers like `Next` closing a `Do`),
+  hoists procedures into the env's procedure table, and emits a nested
+  statement tree (`StmtN::For`, `StmtN::Do` with their bodies) that the
+  evaluator runs directly, which keeps nested loops correct. Plain
+  `exec_block` is now an alias; both entry points handle every
+  construct. Runaway recursion is capped (32 deep), runaway loops at
+  100k iterations.
+- **Still unsupported with clear diagnostics** — `ReDim`, multi-dim
+  arrays, `Set`, `On Error`, `With`, `Select Case`, `Class`,
+  `Property Get/Let/Set`, member access outside Response/Request.
 
 Acceptance criteria:
 
@@ -810,7 +849,7 @@ Definition of done:
 
 ### Milestone 2 — Core language subset
 
-**Status:** Not started
+**Status:** Built
 
 Deliverables:
 
@@ -973,7 +1012,7 @@ This checklist applies before every pull request is marked ready for review.
 
 ## 12. Immediate next steps
 
-1. Milestone 2 — core language subset: arrays, procedures (`Sub`/`Function`/`Call`), conversions, `Date`/`Time` functions, and `Exit For`/`Exit Do`.
-2. Golden tests for each new language feature as it lands.
-3. Milestone 3 prep: finish the Response model (`Redirect`, `ContentType`, cookies) and request timeouts/size limits.
-4. Keep `AGENTS.md` in step with new conventions as they emerge.
+1. Milestone 3 — request and response model: `Request.Form`/`Cookies`/`ServerVariables`, `Response.Redirect`/`ContentType`/cookies/status, request timeouts and body-size limits, proper error responses.
+2. Finish the variant-semantics workstream: multi-dimensional arrays, `Byte`/binary data (`Request.BinaryRead`/`Response.BinaryWrite`), and a documented coercion table.
+3. Golden tests for each new Response/Request feature as it lands.
+4. Keep `AGENTS.md` in step with new conventions as they emerge (note: the M2 executor's normalization pass over deferred delimiters is the load-bearing architecture for cross-block and nested constructs).

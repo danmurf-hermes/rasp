@@ -3,10 +3,9 @@
 pub mod eval;
 pub mod lexer;
 pub mod parser;
+pub mod vb_datetime;
 
-pub use eval::exec_block;
-pub use eval::exec_block_loops;
-pub use eval::{ExecEnv, ResponseBuffer};
+pub use eval::{ExecEnv, ResponseBuffer, exec_block, exec_block_loops};
 pub use lexer::Tok;
 pub use parser::{Expr, Stmt, Variant, parse_block};
 
@@ -16,11 +15,17 @@ mod tests {
     use asp_core::AspError;
     use std::collections::HashMap;
 
-    fn render(source: &str) -> String {
-        let stmts = parse_block(source, 1).unwrap();
+    fn render(src: &str) -> String {
+        let stmts = parse_block(src, 1).unwrap();
         let mut env = ExecEnv::new();
         exec_block_loops(&stmts, &mut env).unwrap();
         env.response.body()
+    }
+
+    fn render_err(src: &str) -> AspError {
+        let stmts = parse_block(src, 1).unwrap();
+        let mut env = ExecEnv::new();
+        exec_block_loops(&stmts, &mut env).unwrap_err()
     }
 
     #[test]
@@ -53,10 +58,7 @@ mod tests {
     #[test]
     fn block_if_parses() {
         let src = "If 1 < 2 Then\n  Response.Write \"yes\"\nElse\n  Response.Write \"no\"\nEnd If";
-        let stmts = parse_block(src, 1).unwrap();
-        let mut env = ExecEnv::new();
-        exec_block(&stmts, &mut env).unwrap();
-        assert_eq!(env.response.body(), "yes");
+        assert_eq!(render(src), "yes");
     }
 
     #[test]
@@ -70,45 +72,147 @@ ElseIf x = 3 Then
 Else
   Response.Write \"other\"
 End If";
-        let stmts = parse_block(src, 1).unwrap();
-        let mut env = ExecEnv::new();
-        exec_block(&stmts, &mut env).unwrap();
-        assert_eq!(env.response.body(), "three");
+        assert_eq!(render(src), "three");
     }
 
     #[test]
     fn for_next_counts() {
         let src = "Dim i, total: total = 0\nFor i = 1 To 5\n  total = total + i\nNext\nResponse.Write total";
-        let stmts = parse_block(src, 1).unwrap();
-        let mut env = ExecEnv::new();
-        exec_block_loops(&stmts, &mut env).unwrap();
-        assert_eq!(env.response.body(), "15");
+        assert_eq!(render(src), "15");
     }
 
     #[test]
     fn for_next_negative_step() {
-        let stmts = parse_block("For i = 3 To 1 Step -1: Response.Write i: Next", 1).unwrap();
-        let mut env = ExecEnv::new();
-        exec_block_loops(&stmts, &mut env).unwrap();
-        assert_eq!(env.response.body(), "321");
+        assert_eq!(
+            render("For i = 3 To 1 Step -1: Response.Write i: Next"),
+            "321"
+        );
+    }
+
+    #[test]
+    fn nested_for_loops() {
+        let src = "For i = 1 To 2\nFor j = 1 To 2\nResponse.Write i & j\nNext\nNext";
+        assert_eq!(render(src), "11122122");
+    }
+
+    #[test]
+    fn for_inside_do() {
+        let src = "n = 0\nDo While n < 2\nFor i = 1 To 2\nResponse.Write i\nNext\nn = n + 1\nLoop";
+        assert_eq!(render(src), "1212");
+    }
+
+    #[test]
+    fn exit_for_and_exit_do() {
+        let src = "For i = 1 To 10\nIf i = 3 Then Exit For\nResponse.Write i\nNext";
+        assert_eq!(render(src), "12");
+        let src = "n = 0\nDo While True\nn = n + 1\nIf n >= 2 Then Exit Do\nLoop\nResponse.Write n";
+        assert_eq!(render(src), "2");
     }
 
     #[test]
     fn do_while_loops() {
         let src = "Dim n: n = 0\nDo While n < 3\n  n = n + 1\nLoop\nResponse.Write n";
-        let stmts = parse_block(src, 1).unwrap();
-        let mut env = ExecEnv::new();
-        exec_block_loops(&stmts, &mut env).unwrap();
-        assert_eq!(env.response.body(), "3");
+        assert_eq!(render(src), "3");
     }
 
     #[test]
     fn do_until_trailing_condition() {
         let src = "Dim n: n = 0\nDo\n  n = n + 1\nLoop Until n >= 2\nResponse.Write n";
+        assert_eq!(render(src), "2");
+    }
+
+    #[test]
+    fn arrays_fixed_size_and_indexed() {
+        let src =
+            "Dim a(2)\na(0) = \"x\"\na(1) = 5\na(2) = a(1) + 1\nResponse.Write a(0) & a(1) & a(2)";
+        assert_eq!(render(src), "x56");
+    }
+
+    #[test]
+    fn array_literal_and_ubound() {
+        let src = "names = Array(\"ann\", \"bob\", \"cid\")\nResponse.Write UBound(names) & \":\" & names(1)";
+        assert_eq!(render(src), "2:bob");
+    }
+
+    #[test]
+    fn split_and_join() {
+        let src = "parts = Split(\"a,b,c\", \",\")\nResponse.Write UBound(parts) & Join(parts, \"-\") & parts(2)";
+        assert_eq!(render(src), "2a-b-cc");
+    }
+
+    #[test]
+    fn array_index_out_of_range_is_runtime_error() {
+        let err = render_err("Dim a(2): a(5) = 1");
+        assert!(matches!(err, AspError::Runtime(d) if d.message.contains("out of range")));
+    }
+
+    #[test]
+    fn sub_call_before_and_after_definition() {
+        let src = "greet \"Dan\"\nSub greet(who)\n  Response.Write \"hi \" & who\nEnd Sub\ngreet \"Claire\"";
+        assert_eq!(render(src), "hi Danhi Claire");
+    }
+
+    #[test]
+    fn function_returns_and_exits() {
+        let src = "Response.Write double(21)\nFunction double(n)\n  double = n * 2\nEnd Function";
+        assert_eq!(render(src), "42");
+    }
+
+    #[test]
+    fn byref_writeback_and_byval_isolation() {
+        let src = "n = 5\nbump n\nResponse.Write n\nm = 7\nCall bump(m)\nResponse.Write m\nSub bump(x)\n  x = x + 1\nEnd Sub";
+        assert_eq!(render(src), "68");
+    }
+
+    #[test]
+    fn recursion_within_cap() {
+        let src = "Response.Write fact(5)\nFunction fact(n)\n  If n <= 1 Then\n    fact = 1\n  Else\n    fact = n * fact(n - 1)\n  End If\nEnd Function";
+        assert_eq!(render(src), "120");
+    }
+
+    #[test]
+    fn function_return_via_name_assignment() {
+        let src = "Function pick(flag)\n  If flag Then\n    pick = \"yes\"\n  Else\n    pick = \"no\"\n  End If\nEnd Function\nResponse.Write pick(True) & pick(False)";
+        assert_eq!(render(src), "yesno");
+    }
+
+    #[test]
+    fn exit_function_skips_rest() {
+        let src = "Function half(n)\n  If n > 100 Then\n    half = 99\n    Exit Function\n  End If\n  half = n / 2\nEnd Function\nResponse.Write half(200) & half(10)";
+        assert_eq!(render(src), "995");
+    }
+
+    #[test]
+    fn wrong_argument_count_is_clear() {
+        let err = render_err("Function f(a)\nEnd Function\nf 1, 2");
+        assert!(matches!(err, AspError::Runtime(d) if d.message.contains("expects 1 argument")));
+    }
+
+    #[test]
+    fn unbalanced_delimiters_are_clear() {
+        let e1 = render_err("For i = 1 To 3\nx = 1");
+        assert!(matches!(e1, AspError::Runtime(d) if d.message.contains("missing 'Next'")));
+        let e2 = render_err("Next");
+        assert!(matches!(e2, AspError::Runtime(d) if d.message.contains("matching 'For'")));
+        let e3 = render_err("Do While True\nx = 1");
+        assert!(matches!(e3, AspError::Runtime(d) if d.message.contains("missing 'Loop'")));
+    }
+
+    #[test]
+    fn unbalanced_procedure_is_clear() {
+        let err = render_err("Sub s()\nResponse.Write 1");
+        assert!(matches!(err, AspError::Runtime(d) if d.message.contains("missing 'End Sub'")));
+    }
+
+    #[test]
+    fn cross_block_loop_pairs_through_delimiters() {
+        // Simulates flattening: For in one block, Next in a later one.
+        let src = "For i = 1 To 2\nResponse.Write \"[\" & i\nNext";
         let stmts = parse_block(src, 1).unwrap();
+        assert!(matches!(stmts[0], Stmt::ForLoopOpen { .. }));
         let mut env = ExecEnv::new();
         exec_block_loops(&stmts, &mut env).unwrap();
-        assert_eq!(env.response.body(), "2");
+        assert_eq!(env.response.body(), "[1[2");
     }
 
     #[test]
@@ -148,10 +252,7 @@ End If";
     #[test]
     fn response_clear_drops_buffer() {
         let src = "Response.Write \"old\"\nResponse.Clear\nResponse.Write \"new\"";
-        let stmts = parse_block(src, 1).unwrap();
-        let mut env = ExecEnv::new();
-        exec_block(&stmts, &mut env).unwrap();
-        assert_eq!(env.response.body(), "new");
+        assert_eq!(render(src), "new");
     }
 
     #[test]
@@ -165,10 +266,10 @@ End If";
 
     #[test]
     fn empty_writes_as_blank() {
-        let stmts = parse_block("Dim never: Response.Write \"[\" & never & \"]\"", 1).unwrap();
-        let mut env = ExecEnv::new();
-        exec_block(&stmts, &mut env).unwrap();
-        assert_eq!(env.response.body(), "[]");
+        assert_eq!(
+            render("Dim never: Response.Write \"[\" & never & \"]\""),
+            "[]"
+        );
     }
 
     #[test]
@@ -178,32 +279,120 @@ End If";
     }
 
     #[test]
+    fn procedure_calls_case_insensitive() {
+        let out = render("GREET \"x\"\nSUB GREET(w)\nResponse.Write W & w\nEND SUB");
+        assert_eq!(out, "xx");
+    }
+
+    #[test]
     fn unsupported_features_are_clear_errors() {
-        let err = parse_block("Sub greet\nEnd Sub", 1).unwrap_err();
+        let err = parse_block("Set x = Server.CreateObject(\"Thing\")", 1).unwrap_err();
+        assert!(matches!(err, AspError::Syntax(d) if d.message.contains("not supported")));
+        let err = parse_block("On Error Resume Next", 1).unwrap_err();
+        assert!(matches!(err, AspError::Syntax(d) if d.message.contains("not supported")));
+        let err = parse_block("ReDim a(5)", 1).unwrap_err();
         assert!(matches!(err, AspError::Syntax(d) if d.message.contains("not supported")));
     }
 
     #[test]
-    fn response_in_expression_position_is_a_clear_error() {
-        let err = parse_block("Dim n: n = Response.Write", 1).unwrap_err();
-        assert!(matches!(err, AspError::Syntax(d) if d.message.contains("expression position")));
-    }
-
-    #[test]
     fn division_by_zero_is_runtime_error() {
-        let stmts = parse_block("Response.Write 1 / 0", 1).unwrap();
-        let mut env = ExecEnv::new();
-        let err = exec_block(&stmts, &mut env).unwrap_err();
+        let err = render_err("Response.Write 1 / 0");
         assert!(matches!(err, AspError::Runtime(d) if d.message.contains("division by zero")));
     }
 
     #[test]
     fn runaway_loops_are_capped() {
-        let src = "Do While True\n  n = n + 1\nLoop";
-        let stmts = parse_block(src, 1).unwrap();
-        let mut env = ExecEnv::new();
-        let err = exec_block_loops(&stmts, &mut env).unwrap_err();
+        let err = render_err("Do While True\n  n = n + 1\nLoop");
         assert!(matches!(err, AspError::Runtime(d) if d.message.contains("iteration limit")));
+    }
+
+    #[test]
+    fn runaway_recursion_is_capped() {
+        let err = render_err("Function r()\n  r = r()\nEnd Function\nr");
+        assert!(
+            matches!(err, AspError::Runtime(d) if d.message.contains("depth") || d.message.contains("argument"))
+        );
+    }
+
+    #[test]
+    fn conversions_bankers_rounding() {
+        assert_eq!(
+            render("Response.Write CInt(2.5) & CInt(3.5) & CInt(0.5) & CInt(1.5)"),
+            "2402"
+        );
+        assert_eq!(render("Response.Write CInt(\"123\")"), "123");
+        assert_eq!(render("Response.Write CLng(2147483647)"), "2147483647");
+    }
+
+    #[test]
+    fn conversion_overflow_is_error() {
+        let err = render_err("Response.Write CInt(40000)");
+        assert!(matches!(err, AspError::Runtime(d) if d.message.contains("overflow")));
+    }
+
+    #[test]
+    fn date_builtins() {
+        assert_eq!(render("Response.Write Year(\"2026-09-30\")"), "2026");
+        assert_eq!(render("Response.Write Month(\"9/30/2026\")"), "9");
+        assert_eq!(render("Response.Write Day(\"2026-09-30\")"), "30");
+        assert_eq!(render("Response.Write Hour(\"2026-09-30 14:30:00\")"), "14");
+        assert_eq!(render("Response.Write Minute(\"14:30\")"), "30");
+        assert_eq!(render("Response.Write Second(\"14:30:07\")"), "7");
+        // 2026-09-30 is a Wednesday (Sunday=1 numbering -> 4).
+        assert_eq!(render("Response.Write Weekday(\"2026-09-30\")"), "4");
+        assert_eq!(
+            render("Response.Write DateSerial(2026, 9, 30)"),
+            "2026-09-30"
+        );
+        assert_eq!(
+            render("Response.Write DateSerial(2026, 13, 1)"),
+            "2027-01-01"
+        );
+        assert_eq!(
+            render("Response.Write DateSerial(2026, 2, 29)"),
+            "2026-03-01"
+        );
+        assert_eq!(
+            render("Response.Write DateAdd(\"yyyy\", 1, \"2026-02-28\")"),
+            "2027-02-28"
+        );
+        assert_eq!(
+            render("Response.Write DateAdd(\"m\", 1, \"2026-01-31\")"),
+            "2026-02-28"
+        );
+        assert_eq!(
+            render("Response.Write DateDiff(\"d\", \"2026-09-29\", \"2026-09-30\")"),
+            "1"
+        );
+        assert_eq!(
+            render("Response.Write DateDiff(\"m\", \"2026-01-15\", \"2026-03-01\")"),
+            "2"
+        );
+        assert_eq!(render("Response.Write CDate(\"9/30/2026\")"), "2026-09-30");
+        assert_eq!(
+            render("Response.Write DateValue(\"2026-09-30 08:00\")"),
+            "2026-09-30"
+        );
+    }
+
+    #[test]
+    fn date_variable_arithmetic() {
+        let src = "d = CDate(\"2026-09-30\")\ne = d + 2\nResponse.Write e";
+        assert_eq!(render(src), "2026-10-02");
+        let src = "Response.Write DateDiff(\"d\", \"2026-09-30\", \"2026-10-05\")";
+        assert_eq!(render(src), "5");
+    }
+
+    #[test]
+    fn is_functions() {
+        assert_eq!(
+            render("Response.Write IsArray(Array(1)) & IsDate(\"x\") & IsDate(\"9/30/2026\")"),
+            "TrueFalseTrue"
+        );
+        assert_eq!(
+            render("Response.Write IsEmpty(x) & IsNumeric(72)"),
+            "TrueTrue"
+        );
     }
 
     #[test]
