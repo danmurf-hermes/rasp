@@ -1,96 +1,130 @@
 # RASP
 
-> Experimental, vibe-coded. See [docs/asp-classic-interpreter-plan.md](docs/asp-classic-interpreter-plan.md) for the full project plan and current status.
+> Experimental, vibe-coded.
 
-## What it is
+A Classic ASP interpreter in Rust. RASP runs existing Classic ASP
+applications from a single Rust binary (or a Docker image) on Linux,
+macOS, Windows, or any platform that supports containers — no Windows
+or IIS required.
 
-RASP runs existing Classic ASP applications from a single Rust binary (or a
-Docker image) on Linux, macOS, Windows, or any platform that supports
-containers — no Windows or IIS required.
+## Features
 
-## Status: Objects and filesystem (Milestone 5)
+| Feature | Status |
+|---|---|
+| ASP page model (text, `<% %>`, `<%= %>`, `<%@ Language %>`) | ✅ |
+| `#include` directives (`file=`, `virtual=`) with path confinement | ✅ |
+| `<SCRIPT RUNAT=Server LANGUAGE=VBScript>` blocks | ✅ |
+| VBScript expressions with full precedence | ✅ |
+| `If`/`ElseIf`/`Else` (block and single-line) | ✅ |
+| Loops: `For`/`Next`, `Do`/`Loop`, nested, HTML interleave | ✅ |
+| `Exit For`/`Exit Do`/`Exit Sub`/`Exit Function` | ✅ |
+| `Sub`/`Function` with `Call`, ByRef/ByVal | ✅ |
+| Fixed-size arrays; `Array()`, `UBound`, `Split`, `Join` | ✅ |
+| Conversions (`CInt`, `CLng`, `CDbl`, `CBool`, `CDate`, `Is*`) | ✅ |
+| Date/Time functions (`DateSerial`, `DateAdd`, `DateDiff`, parts) | ✅ |
+| `Request.QueryString` / `Form` / `Cookies` / `ServerVariables` | ✅ |
+| `Response.Write` / `End` / `Clear` / `Redirect` / `ContentType` | ✅ |
+| `Response.Cookies` and response headers/status | ✅ |
+| `Session` values, `Contents`, `SessionID`, `Timeout`, `Abandon` | ✅ |
+| HMAC-signed `ASPSESSIONID` cookie | ✅ |
+| `global.asa`: `Application_OnStart`, `Session_OnStart`/`OnEnd` | ✅ |
+| `Application` values, `Contents`, `Lock`/`UnLock` | ✅ (lock is a flag; no concurrent requests yet) |
+| `Scripting.Dictionary` (case-sensitive, insertion-ordered) | ✅ |
+| `Scripting.FileSystemObject` sandboxed basics | ✅ |
+| `Server.MapPath` / `Execute` / `Transfer` / `CreateObject` | ✅ |
+| `ADODB.Connection` (Open/Close/Execute/transactions) | ✅ |
+| `ADODB.Command` with parameterised queries | ✅ |
+| `ADODB.Recordset` (`MoveNext`, `BOF`/`EOF`, live `Fields`) | ✅ |
+| SQLite (bundled) and PostgreSQL backends | ✅ |
+| `Folder`/`File`/`TextStream` object model | ❌ planned |
+| Multi-dimensional arrays, `Byte`/binary data | ❌ planned |
+| `Application_OnEnd` | ❌ planned (IIS fires it on app recycle) |
+| MySQL / MariaDB | ❌ planned |
+| Configuration file (port, limits, logging) | ❌ planned |
+| JScript | ❌ not started |
 
-Workstreams and milestones are tracked in
-[docs/asp-classic-interpreter-plan.md](docs/asp-classic-interpreter-plan.md).
-The interpreter renders real pages: VBScript expressions, control flow
-(`If`, `For`/`Next`, `Do`/`Loop` — including bodies that interleave
-markup across `<% %>` blocks, nested loops, `Exit For`/`Exit Do`),
-fixed-size arrays and `Array()`/`UBound`/`Split`/`Join`,
-`Sub`/`Function` procedures with `Call` and ByRef/ByVal parameters,
-conversions (`CInt`/`CLng` with banker's rounding, `CDbl`, `CBool`,
-`CDate`, `Is*`), Date/Time functions (`DateSerial`, `DateAdd`,
-`DateDiff`, `Year`/`Month`/`Day`/…), `Response.Write`/`End`/`Clear`
-plus `Response.Cookies`, `Request.QueryString`/`Form`/`Cookies`
-plus `Request.ServerVariables`, `#include` directives,
-`<SCRIPT RUNAT=Server>` blocks, and `global.asa` events
-(`Session_OnEnd` fires on abandon/timeout with the dying session's
-values) — served over HTTP with session state: `Session` values
-(`Contents`, `SessionID`, `Timeout`, `Abandon`) behind an HMAC-signed
-`ASPSESSIONID` cookie and shared `Application` values with
-`Lock`/`UnLock`. Native objects live behind
-`Server.CreateObject`: a sandboxed `Scripting.FileSystemObject` (paths
-stay inside the application root), `Scripting.Dictionary`,
-`Server.MapPath`/`Execute`/`Transfer`, and the M6 database subset —
-`ADODB.Connection` (Open/Close/Execute/transactions), `ADODB.Command`
-with parameterised queries (`CreateParameter`/`Parameters.Append`),
-and `ADODB.Recordset` (`MoveNext`, `BOF`/`EOF`/`RecordCount`, live
-`Fields`/`Field` reads). SQLite is bundled; PostgreSQL is compiled in
-for host/database connection strings. See
-[examples/database/](examples/database/) for the Docker Compose
-example (credentials come from the environment, never the repo).
+Unsupported syntax fails with a clear "not supported" message. It never
+silently produces wrong output.
 
-## Quick start
+## How to run it
+
+Build from source (needs Rust stable):
 
 ```bash
-# From source (requires Rust stable)
 cargo build -p asp-cli
 ./target/debug/rasp version
+```
 
-# Run a single page against a synthetic request
+Run a single page against a synthetic request:
+
+```bash
 ./target/debug/rasp run --root examples/hello-app hello.asp
+```
 
-# Syntax-check every .asp file in an application
-./target/debug/rasp check --root examples/hello-app
+Syntax-check every `.asp` file in an application:
 
-# Serve the example app over HTTP
+```bash
+./target/debug/rasp check examples/hello-app
+```
+
+Serve an application over HTTP:
+
+```bash
 ./target/debug/rasp serve --root examples/hello-app --port 8080
-curl http://127.0.0.1:8080/loop.asp
+curl http://127.0.0.1:8080/hello.asp
+```
 
-# Session + Application state demo (send the cookie back to count up)
+The server maps URLs to `.asp` pages, applies a default document, and
+keeps session state across requests. Try the demos:
+
+```bash
+# Session + Application counters (send the cookie back to count up)
 curl -c /tmp/jar.txt http://127.0.0.1:8080/state.asp
 curl -b /tmp/jar.txt http://127.0.0.1:8080/state.asp
 
-# Native objects: a Dictionary, and the sandboxed folder listing
+# Native objects: a Dictionary and the sandboxed folder listing
 curl http://127.0.0.1:8080/dict.asp
 curl http://127.0.0.1:8080/files.asp
+```
 
-# Or via Docker
+Or via Docker:
+
+```bash
 docker build -t rasp .
 docker run --rm rasp version
 ```
 
-`check` stays quiet when every page parses (exit 0); `run` prints the
-rendered body to stdout.
+A database example with Docker Compose (SQLite and PostgreSQL) lives in
+[examples/database/](examples/database/). Credentials come from the
+environment, never from the repo.
 
 ## Development
 
-Quality gates (fmt → clippy → tests) run as a pre-commit hook; enable them
-once after cloning:
+The quality gates (format, clippy, tests) run as a pre-commit hook.
+Enable them once after cloning:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
+Run the gates by hand:
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
+cargo test --all
+```
+
 ## Repository layout
 
 ```text
-crates/asp-core      Shared AST, values, errors, page/include model, database trait
+crates/asp-core      Shared AST, values, errors, page model, cookie signing
 crates/asp-vbscript  VBScript lexer, parser, evaluator, ADO object states
 crates/asp-runtime   ASP objects (Request, Response, Server, Session, Application, hosts)
 crates/asp-db        Database adapters (SQLite bundled, PostgreSQL)
 crates/asp-http      HTTP server and request-to-response integration
 crates/asp-cli       The `rasp` executable
-docs/                Project plan and documentation
-examples/            ASP application examples (added from Milestone 1)
-tests/               Integration and golden tests (added from Milestone 2)
+docs/                Documentation
+examples/            ASP application examples
+tests/               Integration and golden tests
 ```
