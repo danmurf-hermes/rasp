@@ -9,5 +9,6 @@ description = "ASP intrinsic objects, request lifecycle, state, and COM mappings
 
 [dependencies]
 asp-core = { path = "../asp-core" }
+asp-db = { path = "../asp-db" }
 asp-vbscript = { path = "../asp-vbscript" }
 percent-encoding.workspace = true

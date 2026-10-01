@@ -1,9 +1,11 @@
 //! Shared AST, values, errors, page model, and include model for RASP.
 
+pub mod db;
 pub mod error;
 pub mod fs;
 pub mod parser;
 
+pub use db::{AdoValue, ConnectionTarget, DatabaseEngine};
 pub use error::{AspError, AspResult, Diagnostic};
 pub use parser::Page;
 

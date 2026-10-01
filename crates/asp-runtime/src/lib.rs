@@ -10,6 +10,9 @@ pub mod host;
 pub mod session;
 
 pub use asp_vbscript::StateStores;
+
+pub mod ado_host;
+pub use ado_host::RuntimeAdoHost;
 pub use host::RuntimeHost;
 pub use session::{GlobalAsa, SESSION_COOKIE_NAME, SessionManager, fire_global_asa_events};
 
@@ -252,6 +255,7 @@ fn fresh_env(base: &ExecEnv) -> ExecEnv {
     env.request_data = base.request_data.clone();
     env.server_variables = base.server_variables.clone();
     env.host = base.host.clone();
+    env.ado_host = base.ado_host.clone();
     env
 }
 
@@ -332,7 +336,8 @@ pub fn render_page_stores(
         .with_request_data(request_data)
         .with_server_variables(server_variables)
         .with_state(stores.clone())
-        .with_host(host as std::rc::Rc<dyn asp_vbscript::NativeHost>);
+        .with_host(host as std::rc::Rc<dyn asp_vbscript::NativeHost>)
+        .with_ado_host(std::rc::Rc::new(ado_host::RuntimeAdoHost::new(app.clone())));
     let out = render_assembled(&assembled, &base)?;
     let exit_stores = StateStores {
         session: out.session.clone().unwrap_or_default(),
@@ -618,7 +623,7 @@ mod tests {
         let root = build_app("objerr");
         fs::write(
             root.join("p.asp"),
-            "<% Set x = Server.CreateObject(\"ADODB.Connection\") %>",
+            "<% Set x = Server.CreateObject(\"MySql.ProgID.Nowhere\") %>",
         )
         .unwrap();
         let app = AppRoot::new(&root);
@@ -633,5 +638,6 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("not available"), "{msg}");
         assert!(msg.contains("Scripting.Dictionary"), "{msg}");
+        assert!(msg.contains("ADODB.Connection"), "{msg}");
     }
 }

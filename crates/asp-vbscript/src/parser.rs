@@ -87,6 +87,10 @@ impl Variant {
             Variant::Native(obj) => match &*obj.state.borrow() {
                 crate::native::NativeState::Dictionary(_) => "Dictionary".to_string(),
                 crate::native::NativeState::FileSystem => "FileSystemObject".to_string(),
+                crate::native::NativeState::Ado(cell) => {
+                    let ado = cell.borrow();
+                    ado.display_name().to_string()
+                }
             },
             Variant::ObjectRef(name) => name.clone(),
             Variant::Date(d) => crate::vb_datetime::render(*d),
@@ -218,6 +222,13 @@ pub enum Stmt {
     /// A member-call expression executed for effect (`d.Add "k", "v"`):
     /// value discarded.
     ExprStatement(Box<Expr>),
+    /// `obj.path.to.prop = value` on a native/ADO object (`cmd.CommandText =
+    /// sql`, `param.Value = v`).
+    NativePropAssign {
+        obj: Expr,
+        prop: String,
+        value: Expr,
+    },
     /// `Server.Execute "page"` — render the page inline; output merges
     /// into the current buffer.
     ServerExecute(String),
@@ -1158,6 +1169,34 @@ impl P {
                 continue;
             }
             break;
+        }
+        // Property assignment: `obj.path.to = expr` (e.g.
+        // `cmd.CommandText = sql`, `param.Value = v`). The base
+        // expression keeps the dotted chain; the last member is the
+        // assigned property.
+        if matches!(self.peek(), Tok::Sym(s) if s == "=") {
+            self.advance();
+            let value = self.parse_expr()?;
+            if matches!(self.peek(), Tok::LineEnd) {
+                self.advance();
+            }
+            let Some(prop) = path.pop() else {
+                unreachable!("path starts with the base name");
+            };
+            let mut it = path.into_iter();
+            let first = it.next().unwrap_or_default();
+            let mut expr = Expr::Variable(first);
+            for member in it {
+                expr = Expr::NativeProp {
+                    obj: Box::new(expr),
+                    prop: member,
+                };
+            }
+            return Ok(Stmt::NativePropAssign {
+                obj: expr,
+                prop,
+                value,
+            });
         }
         // Optional parened or bare args after the last member.
         let mut args: Vec<Expr> = Vec::new();

@@ -26,11 +26,14 @@
 //! Runaway loops and runaway recursion are capped so a bad page
 //! surfaces as a runtime error instead of a hang.
 
+use crate::ado::{AdoHost, AdoState};
 use crate::native::{NativeHost, NativeState, create_native};
 use crate::parser::{Expr, Param, Stmt, Variant, parse_number};
 use crate::vb_datetime;
+use asp_core::db::AdoValue;
 use asp_core::{AspError, AspResult, Diagnostic};
 use chrono::{Datelike, Timelike};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -168,6 +171,9 @@ pub struct ExecEnv {
     /// Host services for native objects (`Server.Execute` render,
     /// FileSystemObject file access). Absent in bare-engine tests.
     pub host: Option<Rc<dyn NativeHost>>,
+    /// Database services for ADO objects (`ADODB.*`, M6). Absent in
+    /// bare-engine tests.
+    pub ado_host: Option<Rc<dyn AdoHost>>,
     /// Hoisted procedures keyed lower-case name.
     procs: HashMap<String, Proc>,
     /// Active procedure frame (locals shadowing), if any.
@@ -215,6 +221,12 @@ impl ExecEnv {
     /// access, `Server.Execute` rendering).
     pub fn with_host(mut self, host: Rc<dyn NativeHost>) -> Self {
         self.host = Some(host);
+        self
+    }
+
+    /// Database services for ADO objects (`ADODB.*`).
+    pub fn with_ado_host(mut self, host: Rc<dyn AdoHost>) -> Self {
+        self.ado_host = Some(host);
         self
     }
 }
@@ -502,6 +514,12 @@ fn exec_plain(stmt: &Stmt, env: &mut ExecEnv) -> AspResult<Flow> {
         }
         Stmt::ExprStatement(expr) => {
             eval_expr(expr, env)?;
+            Ok(Flow::Normal)
+        }
+        Stmt::NativePropAssign { obj, prop, value } => {
+            let target = eval_expr(obj, env)?;
+            let v = eval_expr(value, env)?;
+            ado_prop_set(&target, prop, &v)?;
             Ok(Flow::Normal)
         }
         Stmt::ServerExecute(path) => {
@@ -862,10 +880,689 @@ fn exec_native_call(
         ));
     };
     let m = method.to_ascii_lowercase();
-    if matches!(&*obj.state.borrow(), NativeState::Dictionary(_)) {
-        exec_dict_call(&obj.state, &m, args)
-    } else {
-        exec_fso_call(&m, args, env)
+    let NativeState::Ado(cell) = &*obj.state.borrow() else {
+        let is_dict = matches!(&*obj.state.borrow(), NativeState::Dictionary(_));
+        if is_dict {
+            return exec_dict_call(&obj.state, &m, args);
+        }
+        return exec_fso_call(&m, args, env);
+    };
+    let cell = Rc::clone(cell);
+    exec_ado_call(&cell, &m, args, env)
+}
+
+/// ADO dispatch (`ADODB.*`, M6). Every real database call goes through
+/// the host; this code routes verbs to the right object state.
+fn exec_ado_call(
+    cell: &crate::ado::SharedAdo,
+    m: &str,
+    args: &[Variant],
+    env: &mut ExecEnv,
+) -> AspResult<Variant> {
+    let kind = cell.borrow().progid().to_string();
+    match kind.as_str() {
+        "ADODB.Connection" => exec_connection_call(cell, m, args, env),
+        "ADODB.Command" => exec_command_call(cell, m, args, env),
+        "ADODB.Recordset" => exec_recordset_call(cell, m, args),
+        "ADODB.Fields" => exec_fields_call(cell, m, args),
+        "ADODB.Field" => exec_field_call(cell, m, args),
+        "ADODB.Parameters" => exec_parameters_call(cell, m, args),
+        "ADODB.Parameter" => exec_parameter_call(cell, m, args),
+        other => Err(rt_error(
+            1,
+            format!("'{other}' is not a supported ADO object"),
+        )),
+    }
+}
+
+/// Argument helpers shared by the ADO dispatchers.
+fn ado_need(what: &str, m: &str, args: &[Variant], n: usize) -> AspResult<()> {
+    if args.len() != n {
+        return Err(rt_error(
+            1,
+            format!("{what}.{m} expects {n} argument(s), got {}", args.len()),
+        ));
+    }
+    Ok(())
+}
+
+/// `ADODB.Connection` verbs.
+fn exec_connection_call(
+    cell: &crate::ado::SharedAdo,
+    m: &str,
+    args: &[Variant],
+    env: &mut ExecEnv,
+) -> AspResult<Variant> {
+    match m {
+        "open" => {
+            ado_need("Connection", m, args, 1)?;
+            let cs = match &args[0] {
+                Variant::Str(s) => s.clone(),
+                other => {
+                    return Err(rt_error(
+                        1,
+                        format!(
+                            "Connection.Open requires a string connection string, got '{}'",
+                            other.display()
+                        ),
+                    ));
+                }
+            };
+            // Already open: ADO errors on a double Open.
+            let already = {
+                let state = cell.borrow();
+                let AdoState::Connection { engine, .. } = &*state else {
+                    unreachable!("dispatch checked the kind");
+                };
+                engine.is_some()
+            };
+            if already {
+                return Err(rt_error(
+                    1,
+                    "Connection.Open: the connection is already open",
+                ));
+            }
+            let Some(ado_host) = env.ado_host.as_ref() else {
+                return Err(rt_error(
+                    1,
+                    "Connection.Open needs a host (database access is not available here)",
+                ));
+            };
+            let ado_host = Rc::clone(ado_host);
+            let engine = ado_host
+                .db_open(&cs)
+                .map_err(|msg| rt_error(1, format!("Connection.Open: {msg}")))?;
+            let AdoState::Connection {
+                engine: slot,
+                connection_string,
+                commands,
+                ..
+            } = &mut *cell.borrow_mut()
+            else {
+                unreachable!("dispatch checked the kind");
+            };
+            *slot = Some(engine);
+            *connection_string = cs;
+            // Open activates existing bound commands (ADO's
+            // ActiveConnection semantics, simplified to connection-
+            // scoped binding rather than an assignable property).
+            for cmd in commands.iter() {
+                let AdoState::Command { connection, .. } = &mut *cmd.borrow_mut() else {
+                    continue;
+                };
+                *connection = Some(Rc::clone(cell));
+            }
+            Ok(Variant::Empty)
+        }
+        "close" => {
+            ado_need("Connection", m, args, 0)?;
+            let AdoState::Connection { engine, .. } = &mut *cell.borrow_mut() else {
+                unreachable!("dispatch checked the kind");
+            };
+            match engine.take() {
+                Some(_) => Ok(Variant::Empty),
+                None => Err(rt_error(1, "Connection.Close: the connection is not open")),
+            }
+        }
+        "begintrans" => {
+            ado_need("Connection", m, args, 0)?;
+            with_connection_engine(cell, m, |engine| {
+                engine
+                    .borrow_mut()
+                    .begin_trans()
+                    .map(|_| Variant::Empty)
+                    .map_err(|e| rt_error(1, format!("Connection.BeginTrans: {e}")))
+            })
+        }
+        "committrans" => {
+            ado_need("Connection", m, args, 0)?;
+            with_connection_engine(cell, m, |engine| {
+                engine
+                    .borrow_mut()
+                    .commit_trans()
+                    .map(|_| Variant::Empty)
+                    .map_err(|e| rt_error(1, format!("Connection.CommitTrans: {e}")))
+            })
+        }
+        "rollbacktrans" => {
+            ado_need("Connection", m, args, 0)?;
+            with_connection_engine(cell, m, |engine| {
+                engine
+                    .borrow_mut()
+                    .rollback_trans()
+                    .map(|_| Variant::Empty)
+                    .map_err(|e| rt_error(1, format!("Connection.RollbackTrans: {e}")))
+            })
+        }
+        "execute" => {
+            // `conn.Execute` runs a statement with no parameters:
+            // queries return an open `ADODB.Recordset`, updates
+            // return Empty with the count in `RecordsAffected` (the
+            // out-parameter form from real ADO is unwired because
+            // VBScript ByRef captures for it are not supported).
+            ado_need("Connection", m, args, 1)?;
+            let sql = match &args[0] {
+                Variant::Str(s) => s.clone(),
+                other => {
+                    return Err(rt_error(
+                        1,
+                        format!(
+                            "Connection.Execute requires a string SQL statement, got '{}'",
+                            other.display()
+                        ),
+                    ));
+                }
+            };
+            let engine = {
+                let state = cell.borrow();
+                let AdoState::Connection { engine, .. } = &*state else {
+                    unreachable!("dispatch checked the kind");
+                };
+                engine.as_ref().map(std::clone::Clone::clone)
+            };
+            let Some(engine) = engine else {
+                return Err(rt_error(
+                    1,
+                    "Connection.Execute: Operation is not allowed when the object is closed",
+                ));
+            };
+            let run = engine
+                .borrow_mut()
+                .run(&sql, &[])
+                .map_err(|e| rt_error(1, format!("Connection.Execute: {e}")))?;
+            match run {
+                asp_core::db::Run::Rows(result) => {
+                    Ok(Variant::Native(native_from_ado(opened_recordset(result))))
+                }
+                asp_core::db::Run::Affected(rows) => {
+                    let AdoState::Connection {
+                        records_affected, ..
+                    } = &mut *cell.borrow_mut()
+                    else {
+                        unreachable!("dispatch checked the kind");
+                    };
+                    *records_affected = rows as i64;
+                    Ok(Variant::Empty)
+                }
+            }
+        }
+        _ => Err(rt_error(1, format!("'Connection.{m}' is not supported"))),
+    }
+}
+
+/// Run `f` with the connection's engine, erroring clearly when the
+/// connection is not open (the ADO closed-object message).
+fn with_connection_engine<T>(
+    cell: &crate::ado::SharedAdo,
+    m: &str,
+    f: impl FnOnce(&crate::ado::DbEngineHandle) -> AspResult<T>,
+) -> AspResult<T> {
+    let engine = {
+        let state = cell.borrow();
+        let AdoState::Connection { engine, .. } = &*state else {
+            unreachable!("dispatch checked the kind");
+        };
+        engine
+            .as_ref()
+            .map(<crate::ado::DbEngineHandle as std::clone::Clone>::clone)
+    };
+    match engine {
+        Some(engine) => f(&engine),
+        None => Err(rt_error(
+            1,
+            format!("Connection.{m}: Operation is not allowed when the object is closed"),
+        )),
+    }
+}
+
+thread_local! {
+    /// `RecordsAffected` from the last `Connection.Execute` on this
+    /// thread's render, for the `Connection.RecordsAffected` property.
+    static LAST_AFFECTED: std::cell::RefCell<Option<u64>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Build a shared opened-recordset object from a query result
+/// (cursor on the first row, or BOF for empty).
+fn opened_recordset(result: asp_core::db::AdoResult) -> crate::ado::SharedAdo {
+    let rows = result.rows.len();
+    Rc::new(RefCell::new(AdoState::Recordset {
+        result,
+        position: asp_core::db::opened_position(rows),
+        opened: true,
+    }))
+}
+
+/// Extract an ADO cell from a `NativeObj` state (Variant::Native ->
+/// NativeState::Ado). Errors when the object is not ADO.
+fn extract_ado(state: &RefCell<NativeState>) -> AspResult<crate::ado::SharedAdo> {
+    let borrowed = state.borrow();
+    match &*borrowed {
+        NativeState::Ado(cell) => Ok(Rc::clone(cell)),
+        _ => Err(rt_error(1, "expected an ADODB object")),
+    }
+}
+
+/// Run one statement on a connection's engine with the ADO
+/// rows-vs-affected split (`DatabaseEngine::run` decides BEFORE
+/// executing, so a statement never runs twice).
+fn with_connection_run(
+    connection: &crate::ado::SharedAdo,
+    what: &str,
+    sql: &str,
+    params: Vec<asp_core::db::AdoParam>,
+) -> AspResult<asp_core::db::Run> {
+    let engine = {
+        let state = connection.borrow();
+        let AdoState::Connection { engine, .. } = &*state else {
+            unreachable!("exec_command_call checked the kind");
+        };
+        engine.as_ref().map(std::clone::Clone::clone)
+    };
+    let Some(engine) = engine else {
+        return Err(rt_error(1, format!("{what}: the connection is not open")));
+    };
+    engine
+        .borrow_mut()
+        .run(sql, &params)
+        .map_err(|e| rt_error(1, format!("{what}: {e}")))
+}
+
+/// Wrap owned ADO values into parameters for a run call.
+fn amp_params(values: Vec<AdoValue>) -> Vec<asp_core::db::AdoParam> {
+    values
+        .into_iter()
+        .map(|value| asp_core::db::AdoParam { value })
+        .collect()
+}
+
+/// `ADODB.Command` verbs.
+fn exec_command_call(
+    cell: &crate::ado::SharedAdo,
+    m: &str,
+    args: &[Variant],
+    _env: &mut ExecEnv,
+) -> AspResult<Variant> {
+    match m {
+        "execute" => {
+            // `cmd.Execute` runs the prepared SQL on the bound
+            // connection: rows produce an open `ADODB.Recordset`,
+            // updates return Empty (count lands in RecordsAffected).
+            let (sql, connection, params) = {
+                let state = cell.borrow();
+                let AdoState::Command {
+                    connection,
+                    sql,
+                    param_objs,
+                    ..
+                } = &*state
+                else {
+                    unreachable!("dispatch checked the kind");
+                };
+                let mut out = Vec::with_capacity(param_objs.len());
+                for p in param_objs.iter() {
+                    let AdoState::Parameter { value, .. } = &*p.borrow() else {
+                        unreachable!("param_objs only hold Parameters");
+                    };
+                    out.push(
+                        crate::ado::variant_into_ado(value)
+                            .map_err(|msg| rt_error(1, format!("Command.Execute: {msg}")))?,
+                    );
+                }
+                (sql.clone(), connection.clone(), out)
+            };
+            let Some(sql) = sql else {
+                return Err(rt_error(
+                    1,
+                    "Command.Execute: the command has no SQL text (set Command.CommandText)",
+                ));
+            };
+            let Some(connection) = connection else {
+                return Err(rt_error(
+                    1,
+                    "Command.Execute: the command has no active connection (assign Command.ActiveConnection first)",
+                ));
+            };
+            let result =
+                with_connection_run(&connection, "Command.Execute", &sql, amp_params(params))?;
+            match result {
+                asp_core::db::Run::Rows(result) => Ok(Variant::Native(
+                    crate::native::NativeObj {
+                        state: RefCell::new(crate::native::NativeState::Ado(opened_recordset(
+                            result,
+                        ))),
+                    }
+                    .share(),
+                )),
+                asp_core::db::Run::Affected(n) => {
+                    let AdoState::Connection {
+                        records_affected, ..
+                    } = &mut *connection.borrow_mut()
+                    else {
+                        unreachable!("checked above");
+                    };
+                    *records_affected = n as i64;
+                    Ok(Variant::Empty)
+                }
+            }
+        }
+        "createparameter" => {
+            // CreateParameter(name, type, direction, size, value):
+            // size is accepted and validated loosely (it is advisory
+            // in ADO); the value's actual type is used at bind time.
+            if !(args.len() == 1 || args.len() == 3 || args.len() == 5) {
+                return Err(rt_error(
+                    1,
+                    format!(
+                        "Command.CreateParameter expects 1, 3, or 5 argument(s), got {}",
+                        args.len()
+                    ),
+                ));
+            }
+            let name = match &args[0] {
+                Variant::Str(s) => s.clone(),
+                other => other.display(),
+            };
+            if args.len() >= 3 {
+                let AdoState::Command { .. } = &*cell.borrow() else {
+                    unreachable!("dispatch checked the kind");
+                };
+                let type_ok = match args[1].as_number(1) {
+                    Ok(t) => crate::ado::is_known_ado_type(t as i64),
+                    Err(_) => false,
+                };
+                if !type_ok {
+                    return Err(rt_error(
+                        1,
+                        format!(
+                            "Command.CreateParameter: unknown data type argument '{}'",
+                            args[1].display()
+                        ),
+                    ));
+                }
+                // Direction: adParamInput=1, adParamOutput=2,
+                // adParamInputOutput=3, adParamReturnValue=4. Only
+                // input flows are supported.
+                let dir_ok = args[2].as_number(1).is_ok_and(|d| d == 1.0);
+                if !dir_ok {
+                    return Err(rt_error(
+                        1,
+                        "Command.CreateParameter: only adParamInput (1) directions are supported",
+                    ));
+                }
+            }
+            let value = match args.len() {
+                5 => args[4].clone(),
+                _ => Variant::Empty,
+            };
+            let param_state = AdoState::Parameter { name, value };
+            Ok(Variant::Native(
+                crate::native::NativeObj {
+                    state: RefCell::new(crate::native::NativeState::Ado(Rc::new(RefCell::new(
+                        param_state,
+                    )))),
+                }
+                .share(),
+            ))
+        }
+        _ => Err(rt_error(1, format!("'Command.{m}' is not supported"))),
+    }
+}
+
+/// `ADODB.Recordset` verbs.
+fn exec_recordset_call(
+    cell: &crate::ado::SharedAdo,
+    m: &str,
+    args: &[Variant],
+) -> AspResult<Variant> {
+    // `rs.Fields("col")` folds through here: .Fields with parens
+    // parses as a member CALL, but Fields is a collection PROPERTY
+    // whose default item is the lookup.
+    if m == "fields" && args.len() == 1 {
+        let fields_cell = {
+            let state = cell.borrow();
+            let AdoState::Recordset { .. } = &*state else {
+                unreachable!("dispatch checked the kind");
+            };
+            Rc::new(RefCell::new(AdoState::Fields {
+                of: Rc::clone(cell),
+            }))
+        };
+        return ado_fields_item(&fields_cell, &args[0]);
+    }
+    match m {
+        "movenext" => {
+            ado_need("Recordset", m, args, 0)?;
+            let AdoState::Recordset { position, .. } = &mut *cell.borrow_mut() else {
+                unreachable!("dispatch checked the kind");
+            };
+            *position += 1;
+            Ok(Variant::Empty)
+        }
+        "movefirst" => {
+            ado_need("Recordset", m, args, 0)?;
+            let len = result_len(&cell.borrow()) as i64;
+            let AdoState::Recordset { position, .. } = &mut *cell.borrow_mut() else {
+                unreachable!("dispatch checked the kind");
+            };
+            *position = if len > 0 { 0 } else { -1 };
+            Ok(Variant::Empty)
+        }
+        "movelast" => {
+            ado_need("Recordset", m, args, 0)?;
+            let len = result_len(&cell.borrow()) as i64;
+            let AdoState::Recordset { position, .. } = &mut *cell.borrow_mut() else {
+                unreachable!("dispatch checked the kind");
+            };
+            *position = len - 1;
+            Ok(Variant::Empty)
+        }
+        "close" => {
+            ado_need("Recordset", m, args, 0)?;
+            let AdoState::Recordset {
+                result,
+                position,
+                opened,
+            } = &mut *cell.borrow_mut()
+            else {
+                unreachable!("dispatch checked the kind");
+            };
+            *result = asp_core::db::AdoResult::empty();
+            *position = -1;
+            *opened = false;
+            Ok(Variant::Empty)
+        }
+        _ => Err(rt_error(1, format!("'Recordset.{m}' is not supported"))),
+    }
+}
+
+/// Row count of a recordset state.
+fn result_len(state: &AdoState) -> usize {
+    let AdoState::Recordset { result, .. } = state else {
+        unreachable!("checked by caller");
+    };
+    result.rows.len()
+}
+
+/// `ADODB.Fields` verbs (a live view over the owning recordset).
+fn exec_fields_call(cell: &crate::ado::SharedAdo, m: &str, args: &[Variant]) -> AspResult<Variant> {
+    match m {
+        "item" => {
+            ado_need("Fields", m, args, 1)?;
+            ado_fields_item(cell, &args[0])
+        }
+        "refresh" => {
+            ado_need("Fields", m, args, 0)?;
+            Ok(Variant::Empty)
+        }
+        _ => Err(rt_error(1, format!("'Fields.{m}' is not supported"))),
+    }
+}
+
+/// Shared `Fields.Item` implementation (also the Fields default
+/// property): resolve an ordinal or column name on the owning
+/// recordset and hand back a live `ADODB.Field`.
+fn ado_fields_item(cell: &crate::ado::SharedAdo, key: &Variant) -> AspResult<Variant> {
+    let AdoState::Fields { of } = &*cell.borrow() else {
+        unreachable!("dispatch checked the kind");
+    };
+    let of = Rc::clone(of);
+    let index = match key {
+        Variant::Int(i) => *i,
+        Variant::Str(name) => {
+            let owner = of.borrow();
+            let AdoState::Recordset { result, .. } = &*owner else {
+                return Err(rt_error(
+                    1,
+                    "Fields.Item: the owning object is not a Recordset",
+                ));
+            };
+            result
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+                .unwrap_or(usize::MAX) as i64
+        }
+        other => {
+            return Err(rt_error(
+                1,
+                format!(
+                    "Fields.Item requires an ordinal or name, got '{}'",
+                    other.display()
+                ),
+            ));
+        }
+    };
+    if index < 0 || index as usize == usize::MAX {
+        return Err(rt_error(
+            1,
+            "Item cannot be found in the collection corresponding to the requested name or ordinal",
+        ));
+    }
+    let field_state = AdoState::Field {
+        of,
+        index: index as usize,
+    };
+    Ok(Variant::Native(
+        crate::native::NativeObj {
+            state: RefCell::new(crate::native::NativeState::Ado(Rc::new(RefCell::new(
+                field_state,
+            )))),
+        }
+        .share(),
+    ))
+}
+
+/// `ADODB.Field` verbs (a live view over the owning recordset).
+fn exec_field_call(
+    _cell: &crate::ado::SharedAdo,
+    m: &str,
+    _args: &[Variant],
+) -> AspResult<Variant> {
+    match m {
+        "getchunk" | "appendchunk" => Err(rt_error(
+            1,
+            "Field.GetChunk/AppendChunk need binary variant data, which is not supported in Milestone 6",
+        )),
+        _ => Err(rt_error(1, format!("'Field.{m}' is not supported"))),
+    }
+}
+
+/// `ADODB.Parameters` verbs (a live view over the owning command).
+fn exec_parameters_call(
+    cell: &crate::ado::SharedAdo,
+    m: &str,
+    args: &[Variant],
+) -> AspResult<Variant> {
+    match m {
+        "append" => {
+            ado_need("Parameters", m, args, 1)?;
+            let Variant::Native(obj) = &args[0] else {
+                return Err(rt_error(
+                    1,
+                    "Parameters.Append expects an ADODB.Parameter object",
+                ));
+            };
+            let param_cell = extract_ado(&obj.state)?;
+            {
+                let state = param_cell.borrow();
+                if state.progid() != "ADODB.Parameter" {
+                    return Err(rt_error(
+                        1,
+                        "Parameters.Append expects an ADODB.Parameter object",
+                    ));
+                }
+            }
+            let AdoState::Parameters { of } = &*cell.borrow() else {
+                unreachable!("dispatch checked the kind");
+            };
+            let of = Rc::clone(of);
+            let AdoState::Command { param_objs, .. } = &mut *of.borrow_mut() else {
+                unreachable!("Parameters always own a Command");
+            };
+            param_objs.push(param_cell);
+            Ok(Variant::Empty)
+        }
+        "delete" => {
+            ado_need("Parameters", m, args, 1)?;
+            let AdoState::Parameters { of } = &*cell.borrow() else {
+                unreachable!("dispatch checked the kind");
+            };
+            let of = Rc::clone(of);
+            let AdoState::Command { param_objs, .. } = &mut *of.borrow_mut() else {
+                unreachable!("Parameters always own a Command");
+            };
+            let index = match &args[0] {
+                Variant::Int(i) => *i,
+                Variant::Str(name) => param_objs
+                    .iter()
+                    .position(|p| {
+                        let AdoState::Parameter { name: n, .. } = &*p.borrow() else {
+                            unreachable!("param_objs only hold Parameters");
+                        };
+                        n.eq_ignore_ascii_case(name)
+                    })
+                    .unwrap_or(usize::MAX) as i64,
+                other => {
+                    return Err(rt_error(
+                        1,
+                        format!(
+                            "Parameters.Delete requires an ordinal or name, got '{}'",
+                            other.display()
+                        ),
+                    ));
+                }
+            };
+            if index < 0 || index as usize >= param_objs.len() {
+                return Err(rt_error(
+                    1,
+                    "Item cannot be found in the collection corresponding to the requested name or ordinal",
+                ));
+            }
+            param_objs.remove(index as usize);
+            Ok(Variant::Empty)
+        }
+        "refresh" => {
+            ado_need("Parameters", m, args, 0)?;
+            Ok(Variant::Empty)
+        }
+        _ => Err(rt_error(1, format!("'Parameters.{m}' is not supported"))),
+    }
+}
+
+/// `ADODB.Parameter` verbs.
+fn exec_parameter_call(
+    _cell: &crate::ado::SharedAdo,
+    m: &str,
+    _args: &[Variant],
+) -> AspResult<Variant> {
+    match m {
+        "appendchunk" => Err(rt_error(
+            1,
+            "Parameter.AppendChunk needs binary variant data, which is not supported in Milestone 6",
+        )),
+        // Properties carry the rest (Name/Value via NativeProp).
+        _ => Err(rt_error(1, format!("'Parameter.{m}' is not supported"))),
     }
 }
 
@@ -1033,24 +1730,311 @@ fn exec_dict_call(
     }
 }
 
-/// Read a Dictionary default value `dict(key)` / `dict.Item(key)`.
+/// Read a native default value: `dict(key)` / `dict.Item(key)`, and
+/// `rs.Fields("col")` / `cmd.Parameters(i)` collection reads.
 fn native_default_get(target: &Variant, kv: &Variant) -> AspResult<Variant> {
-    if let Variant::Native(obj) = target
-        && let NativeState::Dictionary(pairs) = &*obj.state.borrow()
-    {
+    let Variant::Native(obj) = target else {
+        return Err(rt_error(
+            1,
+            "only Dictionary and ADO collections support a default property read",
+        ));
+    };
+    if let NativeState::Dictionary(pairs) = &*obj.state.borrow() {
         return pairs
             .iter()
             .find(|(k, _)| k == kv)
             .map(|(_, v)| v.clone())
             .ok_or_else(|| rt_error(1, "Element not found in this dictionary"));
     }
+    if let NativeState::Ado(cell) = &*obj.state.borrow() {
+        let progid = cell.borrow().progid().to_string();
+        match progid.as_str() {
+            "ADODB.Fields" => return ado_fields_item(cell, kv),
+            "ADODB.Parameters" => return ado_parameters_item(cell, kv),
+            _ => {}
+        }
+    }
     Err(rt_error(
         1,
-        "only Dictionary supports a default property read",
+        "only Dictionary and ADO collections support a default property read",
     ))
 }
 
-/// Read a native object property (`Dictionary.Count`).
+/// `Parameters.Item(index_or_name)` (also the Parameters default
+/// read): a live `ADODB.Parameter`.
+fn ado_parameters_item(cell: &crate::ado::SharedAdo, kv: &Variant) -> AspResult<Variant> {
+    let AdoState::Parameters { of } = &*cell.borrow() else {
+        unreachable!("dispatch checked the kind");
+    };
+    let of = Rc::clone(of);
+    let AdoState::Command { param_objs, .. } = &*of.borrow() else {
+        unreachable!("Parameters always own a Command");
+    };
+    let hit = match kv {
+        Variant::Int(i) => {
+            if *i < 0 || *i as usize >= param_objs.len() {
+                None
+            } else {
+                Some(*i as usize)
+            }
+        }
+        Variant::Str(name) => param_objs.iter().position(|p| {
+            let AdoState::Parameter { name: n, .. } = &*p.borrow() else {
+                unreachable!("param_objs only hold Parameters");
+            };
+            n.eq_ignore_ascii_case(name)
+        }),
+        other => {
+            return Err(rt_error(
+                1,
+                format!(
+                    "Parameters.Item requires an ordinal or name, got '{}'",
+                    other.display()
+                ),
+            ));
+        }
+    };
+    let Some(hit) = hit else {
+        return Err(rt_error(
+            1,
+            "Item cannot be found in the collection corresponding to the requested name or ordinal",
+        ));
+    };
+    Ok(Variant::Native(native_from_ado(Rc::clone(
+        &param_objs[hit],
+    ))))
+}
+
+/// ADO property writes (`param.Value = v`, `cmd.CommandText = sql`,
+/// `cmd.ActiveConnection = conn`). Anything else errors as
+/// unsupported (ADO's read-only-property message shape).
+fn ado_prop_set(target: &Variant, prop: &str, v: &Variant) -> AspResult<()> {
+    let Variant::Native(obj) = target else {
+        return Err(rt_error(1, "property assignment needs an object"));
+    };
+    let NativeState::Ado(cell) = &*obj.state.borrow() else {
+        return Err(rt_error(
+            1,
+            "property assignment on this object is not supported",
+        ));
+    };
+    let progid = cell.borrow().progid().to_string();
+    let p = prop.to_ascii_lowercase();
+    match (progid.as_str(), p.as_str()) {
+        ("ADODB.Parameter", "value") => {
+            let AdoState::Parameter { value, .. } = &mut *cell.borrow_mut() else {
+                unreachable!("checked above");
+            };
+            *value = v.clone();
+            Ok(())
+        }
+        ("ADODB.Parameter", "name") => {
+            let AdoState::Parameter { name, .. } = &mut *cell.borrow_mut() else {
+                unreachable!("checked above");
+            };
+            *name = v.display();
+            Ok(())
+        }
+        ("ADODB.Command", "commandtext") => {
+            let AdoState::Command { sql, .. } = &mut *cell.borrow_mut() else {
+                unreachable!("checked above");
+            };
+            *sql = Some(v.display());
+            Ok(())
+        }
+        ("ADODB.Command", "activeconnection") => {
+            let Variant::Native(conn_obj) = v else {
+                return Err(rt_error(
+                    1,
+                    "Command.ActiveConnection must be an ADODB.Connection object",
+                ));
+            };
+            let NativeState::Ado(conn_cell) = &*conn_obj.state.borrow() else {
+                return Err(rt_error(
+                    1,
+                    "Command.ActiveConnection must be an ADODB.Connection object",
+                ));
+            };
+            {
+                let conn = conn_cell.borrow();
+                if conn.progid() != "ADODB.Connection" {
+                    return Err(rt_error(
+                        1,
+                        "Command.ActiveConnection must be an ADODB.Connection object",
+                    ));
+                }
+            }
+            let AdoState::Command { connection, .. } = &mut *cell.borrow_mut() else {
+                unreachable!("checked above");
+            };
+            *connection = Some(Rc::clone(conn_cell));
+            Ok(())
+        }
+        _ => Err(rt_error(
+            1,
+            format!("'{prop}' is read-only or unsupported on this object"),
+        )),
+    }
+}
+
+/// ADO property reads per object kind.
+fn ado_prop(cell: &crate::ado::SharedAdo, prop: &str) -> AspResult<Variant> {
+    let p = prop.to_ascii_lowercase();
+    let state = cell.borrow();
+    match (&*state, p.as_str()) {
+        // Connection: state + RecordsAffected.
+        (AdoState::Connection { .. }, "state") => {
+            let AdoState::Connection { engine, .. } = &*state else {
+                unreachable!();
+            };
+            // adStateClosed = 0, adStateOpen = 1.
+            return Ok(Variant::Int(if engine.is_some() { 1 } else { 0 }));
+        }
+        (AdoState::Connection { .. }, "recordsaffected") => {
+            let AdoState::Connection {
+                records_affected, ..
+            } = &*state
+            else {
+                unreachable!();
+            };
+            return Ok(Variant::Int(*records_affected));
+        }
+        // Command: CommandText + ActiveConnection read-back.
+        (AdoState::Command { sql, .. }, "commandtext") => {
+            return Ok(sql
+                .as_ref()
+                .map(|s| Variant::Str(s.clone()))
+                .unwrap_or(Variant::Empty));
+        }
+        (AdoState::Command { .. }, "activeconnection") => {
+            let AdoState::Command { connection, .. } = &*state else {
+                unreachable!();
+            };
+            return Ok(connection
+                .as_ref()
+                .map(|c| Variant::Native(native_from_ado(Rc::clone(c))))
+                .unwrap_or(Variant::Empty));
+        }
+        (AdoState::Command { .. }, "parameters") => {
+            let ado_cell = Rc::clone(cell);
+            let params_state = AdoState::Parameters { of: ado_cell };
+            return Ok(Variant::Native(native_from_ado(Rc::new(RefCell::new(
+                params_state,
+            )))));
+        }
+        // Recordset: cursor flags + Fields live view.
+        (AdoState::Recordset { .. }, "bof") => {
+            let AdoState::Recordset { position, .. } = &*state else {
+                unreachable!();
+            };
+            return Ok(Variant::Bool(*position < 0));
+        }
+        (AdoState::Recordset { .. }, "eof") => {
+            let AdoState::Recordset {
+                result,
+                position,
+                opened,
+                ..
+            } = &*state
+            else {
+                unreachable!();
+            };
+            // An empty set is EOF (like BOF) as soon as it is open;
+            // a non-empty set is EOF when the cursor is at/past end.
+            let eof = !*opened || result.rows.is_empty() || *position >= result.rows.len() as i64;
+            return Ok(Variant::Bool(eof));
+        }
+        (AdoState::Recordset { .. }, "recordcount") => {
+            let AdoState::Recordset { result, .. } = &*state else {
+                unreachable!();
+            };
+            return Ok(Variant::Int(result.rows.len() as i64));
+        }
+        (AdoState::Recordset { .. }, "fields") => {
+            let ado_cell = Rc::clone(cell);
+            let fields_state = AdoState::Fields { of: ado_cell };
+            return Ok(Variant::Native(native_from_ado(Rc::new(RefCell::new(
+                fields_state,
+            )))));
+        }
+        // Field: Name + live Value.
+        (AdoState::Field { of, index }, "name") => {
+            let owner = of.borrow();
+            let AdoState::Recordset { result, .. } = &*owner else {
+                unreachable!("Fields always own a Recordset");
+            };
+            let name = result
+                .columns
+                .get(*index)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            return Ok(Variant::Str(name));
+        }
+        (AdoState::Field { of, index }, "value") => {
+            let owner = of.borrow();
+            let AdoState::Recordset {
+                result, position, ..
+            } = &*owner
+            else {
+                unreachable!("Fields always own a Recordset");
+            };
+            if *position < 0 || *position >= result.rows.len() as i64 {
+                // Reading a field value at BOF/EOF raises the ADO
+                // "either BOF or EOF is True" error.
+                return Err(rt_error(
+                    1,
+                    "Either BOF or EOF is True, or the current record has been deleted; the operation requested by the application requires a current record",
+                ));
+            }
+            let row = &result.rows[*position as usize];
+            let v = row
+                .get(*index)
+                .map(crate::ado::ado_to_variant)
+                .unwrap_or(Variant::Empty);
+            return Ok(v);
+        }
+        // Parameter: Name + Value.
+        (AdoState::Parameter { name, .. }, "name") => {
+            return Ok(Variant::Str(name.clone()));
+        }
+        (AdoState::Parameter { value, .. }, "value") => {
+            return Ok(value.clone());
+        }
+        // Parameters/Fields collection counts.
+        (AdoState::Parameters { of }, "count") => {
+            let owner = of.borrow();
+            let AdoState::Command { param_objs, .. } = &*owner else {
+                unreachable!("Parameters always own a Command");
+            };
+            return Ok(Variant::Int(param_objs.len() as i64));
+        }
+        (AdoState::Fields { .. }, "count") => {
+            let AdoState::Fields { of } = &*state else {
+                unreachable!();
+            };
+            let owner = of.borrow();
+            let AdoState::Recordset { result, .. } = &*owner else {
+                unreachable!("Fields always own a Recordset");
+            };
+            return Ok(Variant::Int(result.columns.len() as i64));
+        }
+        _ => {}
+    }
+    Err(rt_error(
+        1,
+        format!("'{prop}' is not a supported property of this object"),
+    ))
+}
+
+/// Wrap an ADO cell into a Variant::Native object.
+fn native_from_ado(cell: crate::ado::SharedAdo) -> Rc<crate::native::NativeObj> {
+    Rc::new(crate::native::NativeObj {
+        state: RefCell::new(NativeState::Ado(cell)),
+    })
+}
+
+/// Read a native object property (`Dictionary.Count`, ADO field
+/// values, recordset cursor flags).
 fn native_prop(target: &Variant, prop: &str) -> AspResult<Variant> {
     let Variant::Native(obj) = target else {
         return Err(rt_error(
@@ -1058,6 +2042,20 @@ fn native_prop(target: &Variant, prop: &str) -> AspResult<Variant> {
             format!("'{prop}' needs an object created by CreateObject"),
         ));
     };
+    if let NativeState::Ado(cell) = &*obj.state.borrow() {
+        // Zero-arg method reads: `Set rs = cmd.Execute` evaluates the
+        // method as its value (VBScript treats a bare method name as
+        // a call returning the value). Dispatch through the same verb
+        // table with no arguments.
+        let progid = cell.borrow().progid().to_string();
+        match progid.as_str() {
+            "ADODB.Command" if prop.eq_ignore_ascii_case("execute") => {
+                return exec_command_call(cell, "execute", &[], &mut ExecEnv::new());
+            }
+            _ => {}
+        }
+        return ado_prop(cell, prop);
+    }
     if let NativeState::Dictionary(pairs) = &*obj.state.borrow() {
         if prop.eq_ignore_ascii_case("count") {
             return Ok(Variant::Int(pairs.len() as i64));

@@ -1,5 +1,6 @@
 //! VBScript lexer, parser, and evaluator for RASP.
 
+pub mod ado;
 pub mod eval;
 pub mod lexer;
 pub mod native;
