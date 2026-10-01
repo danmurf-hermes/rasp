@@ -13,8 +13,12 @@ pub use asp_vbscript::StateStores;
 
 pub mod ado_host;
 pub use ado_host::RuntimeAdoHost;
+pub use asp_vbscript::{ApplicationState, SessionStore};
 pub use host::RuntimeHost;
-pub use session::{GlobalAsa, SESSION_COOKIE_NAME, SessionManager, fire_global_asa_events};
+pub use session::{
+    EndedEvents, GlobalAsa, SESSION_COOKIE_NAME, SessionManager, fire_ended_global_asa_events,
+    fire_global_asa_events,
+};
 
 use asp_core::error::Diagnostic;
 use asp_core::parser::{Block, Page};

@@ -22,10 +22,12 @@ conversions (`CInt`/`CLng` with banker's rounding, `CDbl`, `CBool`,
 `DateDiff`, `Year`/`Month`/`Day`/…), `Response.Write`/`End`/`Clear`
 plus `Response.Cookies`, `Request.QueryString`/`Form`/`Cookies`
 plus `Request.ServerVariables`, `#include` directives,
-`<SCRIPT RUNAT=Server>` blocks, and `global.asa` events — served over
-HTTP with session state: `Session` values (`Contents`, `SessionID`,
-`Timeout`, `Abandon`) behind an `ASPSESSIONID` cookie and shared
-`Application` values with `Lock`/`UnLock`. Native objects live behind
+`<SCRIPT RUNAT=Server>` blocks, and `global.asa` events
+(`Session_OnEnd` fires on abandon/timeout with the dying session's
+values) — served over HTTP with session state: `Session` values
+(`Contents`, `SessionID`, `Timeout`, `Abandon`) behind an HMAC-signed
+`ASPSESSIONID` cookie and shared `Application` values with
+`Lock`/`UnLock`. Native objects live behind
 `Server.CreateObject`: a sandboxed `Scripting.FileSystemObject` (paths
 stay inside the application root), `Scripting.Dictionary`,
 `Server.MapPath`/`Execute`/`Transfer`, and the M6 database subset —

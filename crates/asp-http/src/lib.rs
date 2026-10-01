@@ -9,9 +9,11 @@
 //! assets are not served — only `.asp` pages.
 
 use asp_core::AppRoot;
+use asp_runtime::session::session_cookie_from_header;
 use asp_runtime::{
-    GlobalAsa, RenderOutput, SESSION_COOKIE_NAME, SessionManager, StateStores, build_request_data,
-    fire_global_asa_events, render_page_stores, session::session_cookie_from_header,
+    EndedEvents, GlobalAsa, RenderOutput, SESSION_COOKIE_NAME, SessionManager, SessionStore,
+    StateStores, build_request_data, fire_ended_global_asa_events, fire_global_asa_events,
+    render_page_stores,
 };
 use std::collections::HashMap;
 use std::io::Read;
@@ -217,7 +219,8 @@ pub fn handle_request_with_state(
     vars.insert("script_name".to_string(), format!("/{root_relative}"));
     match render_page_stores(app, root_relative, request.request_data(), vars, &stores) {
         Ok((out, exit_stores)) => {
-            commit(holder, &session_cookie, &exit_stores);
+            let ended = commit(holder, &session_cookie, &exit_stores);
+            fire_ended_events(holder, &ended);
             let mut response = to_response(out);
             if is_new {
                 response
@@ -227,26 +230,58 @@ pub fn handle_request_with_state(
             (response, is_new)
         }
         Err(asp_core::AspError::PageNotFound(_)) => {
-            commit(holder, &session_cookie, &stores);
+            let ended = commit(holder, &session_cookie, &stores);
+            fire_ended_events(holder, &ended);
             (error_page(404, "Not Found", None), is_new)
         }
         Err(err) => {
             // State writes survive a page error (session values set
             // before the error stay set), so commit what we have.
-            commit(holder, &session_cookie, &stores);
+            let ended = commit(holder, &session_cookie, &stores);
+            fire_ended_events(holder, &ended);
             (server_error_response(err, dev_errors), is_new)
         }
     }
 }
 
-/// Commit the stores back to the manager under its lock.
-fn commit(holder: &ServerHolder, session_cookie: &str, stores: &StateStores) {
+/// Fire `Session_OnEnd`/`Application_OnEnd` for the sessions the just
+/// finished request ended. Event errors are logged (development mode)
+/// and swallowed — the page's own output is already rendered and the
+/// visitor must not see a global.asa bookkeeping failure instead.
+fn fire_ended_events(holder: &ServerHolder, ended: &EndedEvents) {
+    if ended.is_empty() {
+        return;
+    }
+    let Some(asa) = &holder.global_asa else {
+        return;
+    };
+    // Handlers see the application exactly as the just-finished
+    // request left it; their `Application` writes persist, their
+    // `Session` writes die with the session. The sequential server
+    // cannot interleave a page render between the two lock sections.
+    let mut scratch = {
+        let manager = lock_manager(holder);
+        StateStores {
+            session: SessionStore::default(),
+            application: manager.application(),
+        }
+    };
+    if let Err(err) = fire_ended_global_asa_events(asa, ended, &mut scratch) {
+        eprintln!("rasp: global.asa end events: {err}");
+    }
+    let mut manager = lock_manager(holder);
+    manager.commit_application(scratch.application);
+}
+
+/// Commit the stores back to the manager under its lock and report
+/// what ended (abandon/expiry/last session).
+fn commit(holder: &ServerHolder, session_cookie: &str, stores: &StateStores) -> EndedEvents {
     let mut manager = lock_manager(holder);
     manager.commit_request_state(
         session_cookie,
         stores.session.clone(),
         stores.application.clone(),
-    );
+    )
 }
 
 /// Lock the manager, recovering from poisoning (a request that panicked
@@ -634,13 +669,22 @@ mod tests {
         let rel = resolve_request_path(&app, &config, "/sc.asp");
         let response = handle_request(&app, &rel, &request("/sc.asp", "x=1"));
         // The page's own cookie first, then the session cookie every new
-        // visitor gets (IIS behaviour).
+        // visitor gets (IIS behaviour). The session value is signed now:
+        // fixed id prefix plus a 64-hex HMAC under a per-process key.
         assert_eq!(
-            response.set_cookies,
-            vec![
-                "pref=dark".to_string(),
-                "ASPSESSIONID=rasp00000001".to_string()
-            ]
+            response.set_cookies.first().map(String::as_str),
+            Some("pref=dark")
+        );
+        let session_cookie = &response.set_cookies[1];
+        assert!(
+            session_cookie.starts_with("ASPSESSIONID=rasp00000001."),
+            "{session_cookie}"
+        );
+        let sig = session_cookie.split_once('.').unwrap().1;
+        assert_eq!(sig.len(), 64);
+        assert!(
+            sig.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         );
         assert_eq!(response.body, "1");
     }
@@ -822,6 +866,41 @@ mod tests {
             "",
         );
         assert_eq!(after.body, "1");
+    }
+
+    #[test]
+    fn session_on_end_fires_with_final_values_on_abandon() {
+        let root = build_app("onend");
+        fs::write(
+            root.join("global.asa"),
+            "<SCRIPT RUNAT=Server LANGUAGE=\"VBScript\">\nSub Session_OnEnd\n  Application(\"last_ended\") = Session(\"who\")\nEnd Sub\n</SCRIPT>",
+        )
+        .unwrap();
+        fs::write(
+            root.join("set.asp"),
+            "<% Session(\"who\") = Request.QueryString(\"as\") %>set",
+        )
+        .unwrap();
+        fs::write(root.join("bye.asp"), "<% Session.Abandon %>bye").unwrap();
+        fs::write(root.join("read.asp"), "<%= Application(\"last_ended\") %>").unwrap();
+        let app = AppRoot::new(&root);
+        let holder = ServerHolder::for_app_root(&app).unwrap();
+        let first = stateful(&holder, &app, "/set.asp", "as=dan", "", "GET", "");
+        let cookie = set_cookie_value(&first).unwrap();
+        let bye = stateful(
+            &holder,
+            &app,
+            "/bye.asp",
+            "",
+            &format!("ASPSESSIONID={cookie}"),
+            "GET",
+            "",
+        );
+        assert_eq!(bye.body, "bye");
+        // A later visitor reads what Session_OnEnd recorded from the
+        // dying session's final values.
+        let after = stateful(&holder, &app, "/read.asp", "", "", "GET", "");
+        assert_eq!(after.body, "dan");
     }
 
     #[test]

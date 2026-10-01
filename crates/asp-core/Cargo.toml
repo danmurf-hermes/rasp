@@ -8,3 +8,11 @@ repository.workspace = true
 description = "Shared AST, values, errors, page model, and include model for RASP."
 
 [dependencies]
+getrandom = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
+
+[features]
+# Test-only knobs (deterministic signing keys). Never enabled by an
+# ordinary build; integration-test crates opt in via dev-dependencies.
+test-util = []
