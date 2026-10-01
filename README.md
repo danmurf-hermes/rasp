@@ -25,10 +25,17 @@ plus `Request.ServerVariables`, `#include` directives,
 `<SCRIPT RUNAT=Server>` blocks, and `global.asa` events — served over
 HTTP with session state: `Session` values (`Contents`, `SessionID`,
 `Timeout`, `Abandon`) behind an `ASPSESSIONID` cookie and shared
-`Application` values with `Lock`/`UnLock`. Native objects come next to
+`Application` values with `Lock`/`UnLock`. Native objects live behind
 `Server.CreateObject`: a sandboxed `Scripting.FileSystemObject` (paths
-stay inside the application root) and `Scripting.Dictionary`, plus
-`Server.MapPath`/`Execute`/`Transfer`.
+stay inside the application root), `Scripting.Dictionary`,
+`Server.MapPath`/`Execute`/`Transfer`, and the M6 database subset —
+`ADODB.Connection` (Open/Close/Execute/transactions), `ADODB.Command`
+with parameterised queries (`CreateParameter`/`Parameters.Append`),
+and `ADODB.Recordset` (`MoveNext`, `BOF`/`EOF`/`RecordCount`, live
+`Fields`/`Field` reads). SQLite is bundled; PostgreSQL is compiled in
+for host/database connection strings. See
+[examples/database/](examples/database/) for the Docker Compose
+example (credentials come from the environment, never the repo).
 
 ## Quick start
 
@@ -75,9 +82,10 @@ git config core.hooksPath .githooks
 ## Repository layout
 
 ```text
-crates/asp-core      Shared AST, values, errors, page and include model
-crates/asp-vbscript  VBScript lexer, parser, evaluator
-crates/asp-runtime   ASP objects (Request, Response, Server, Session, Application)
+crates/asp-core      Shared AST, values, errors, page/include model, database trait
+crates/asp-vbscript  VBScript lexer, parser, evaluator, ADO object states
+crates/asp-runtime   ASP objects (Request, Response, Server, Session, Application, hosts)
+crates/asp-db        Database adapters (SQLite bundled, PostgreSQL)
 crates/asp-http      HTTP server and request-to-response integration
 crates/asp-cli       The `rasp` executable
 docs/                Project plan and documentation

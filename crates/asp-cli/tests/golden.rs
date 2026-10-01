@@ -302,3 +302,41 @@ fn golden_execute_and_transfer_pages() {
     let _ = std::fs::remove_file(root.join("exec.asp"));
     let _ = std::fs::remove_file(root.join("transfer.asp"));
 }
+#[test]
+fn golden_guestbook_database_page() {
+    // The guestbook seeds its SQLite database inside the example app's
+    // data/ folder; the file is test-local and removed after.
+    let root = example_app();
+    let db_rel = "data/guestbook.db";
+    let db_path = root.join(db_rel);
+    let _ = std::fs::remove_file(&db_path);
+    let get_with_query = |query: &str| -> asp_http::HttpResponse {
+        let config = ServerConfig::default();
+        let root_relative = resolve_request_path(&app(), &config, "/guestbook.asp");
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            path: "/guestbook.asp".to_string(),
+            query: query.to_string(),
+            form: String::new(),
+            cookies: String::new(),
+            headers: Vec::new(),
+        };
+        asp_http::handle_request(&app(), &root_relative, &request)
+    };
+    let response = get_with_query("name=Grace");
+    assert_eq!(response.status, 200);
+    assert!(
+        response.body.contains("<li>Grace</li>"),
+        "{}",
+        response.body
+    );
+    // Second visit accumulates (the DB file persists request to request).
+    let response2 = get_with_query("name=Ada");
+    assert!(
+        response2.body.contains("<li>Grace</li><li>Ada</li>"),
+        "{}",
+        response2.body
+    );
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_dir(root.join("data"));
+}

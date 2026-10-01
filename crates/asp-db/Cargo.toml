@@ -1,0 +1,13 @@
+[package]
+name = "asp-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ADO-compatible database adapters for RASP (SQLite and Postgres)."
+
+[dependencies]
+asp-core = { path = "../asp-core" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+postgres = "0.19"

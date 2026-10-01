@@ -208,7 +208,7 @@ Any status change should be accompanied by a short note in the relevant section 
 | Application state | Built | `Application` named values + `Contents`, `Lock`/`UnLock`; per-process state. Lock is a flag until concurrent request handling exists. |
 | `global.asa` support | Built | `Application_OnStart` (once per process) and `Session_OnStart` (per new session) fire before the page; `Session_OnEnd`/`Application_OnEnd` are parsed but not fired (in-process sessions end with the process). |
 | Filesystem object mapping | Partial | `Server.CreateObject` + native registry; sandboxed `Scripting.FileSystemObject` (existence/reads/creates/deletes/listing, traversal and symlink tests) and `Scripting.Dictionary`; full TextStream/Folder object model still to come. |
-| Database/ADO support | Not started | Start with a small SQL adapter before trying broad ADO compatibility. |
+| Database/ADO support | Built | `asp-db` crate (bundled rusqlite + postgres); `ADODB.Connection/Command/Recordset` + collections via `AdoHost`; parameterised queries; guestbook example golden-tested; Postgres adapter compiles, integration-tested only via Compose manual run. |
 | JScript support | Not started | Optional; prioritize VBScript first. |
 | HTTP server integration | Built | `tiny_http`-backed sequential server maps GET/POST URLs to `.asp` pages, applies the default document, decodes query/form/cookie data, and returns rendered bodies with 404/500 handling. |
 | Configuration | Not started | App root, port, timeouts, limits, logging, session settings. |
@@ -643,28 +643,81 @@ Acceptance criteria:
 
 ### 7.9 Database and ADO compatibility
 
-**Status:** Not started
+**Status:** Built (SQLite integration-tested; Postgres compiles, tested via Compose manual run)
 
-Do not begin by attempting a universal ADO clone. Instead:
+Built in Milestone 6, following the layered approach:
 
-1. Define a minimal connection and recordset interface.
-2. Implement one practical database driver first, preferably SQLite for examples and local testing.
-3. Add PostgreSQL and MySQL adapters once the interface is stable.
-4. Map `ADODB.Connection`, `ADODB.Recordset`, `ADODB.Command`, and connection-string semantics gradually.
-5. Implement transaction and parameter behavior explicitly.
+1. Minimal connection and recordset interface. **Done** — a
+   `DatabaseEngine` trait in `asp-core/src/db.rs` (`execute`/`query`/
+   `run`/`begin_trans`/`commit_trans`/`rollback_trans`/`close`,
+   positional parameters) that the engine never sees directly; ADO
+   object states call the `AdoHost` trait the runtime implements.
+2. SQLite first. **Done** — bundled rusqlite in an `asp-db` crate;
+   golden-tested via `examples/hello-app/guestbook.asp`, integration
+   tests in `crates/asp-runtime/tests/ado.rs`.
+3. PostgreSQL adapter. **Done (same trait)** — tests need a live
+   server; the Docker Compose example connects one for manual runs.
+   MySQL stays planned (clear "not supported yet" error naming the
+   alternatives).
+4. `ADODB.*` mapping. **Done for the core subset** — supported:
+   `Connection` (Open/Close/Execute/BeginTrans/CommitTrans/
+   RollbackTrans, `State`, `RecordsAffected`, command activation),
+   `Command` (CommandText/ActiveConnection/CreateParameter/Execute,
+   `Parameters` collection with live `Parameter` views),
+   `Recordset` (MoveNext/MoveFirst/MoveLast/Close, `BOF`/`EOF`/
+   `RecordCount`, live `Fields`/`Field` value reads with the faithful
+   BOF/EOF read error). Out: OLE DB providers beyond the mapping
+   (Jet/Excel), Server-side cursor types, batch updates,
+   `Recordset.Open` (use `Command.Execute`/`Connection.Execute`),
+   stored-procedure calls, output parameters, binary
+   (`adLongVarBinary`) fields, `Field.GetChunk`/`AppendChunk`.
+5. Transactions and parameters. **Done** — SQLite allows one level
+   (nested `BeginTrans` errors with a count), Postgres maps deeper
+   levels to SAVEPOINTs; parameter values bind live at execute time
+   (later `Value` writes apply to the next execute, ADO behaviour).
+   Date parameter values render through the invariant format and store
+   as text; typed date columns arrive with the variant workstream.
 
-Compatibility considerations:
+Engine-facing model notes:
 
-- ADO connection strings are often provider-specific.
-- Cursor types, lock types, and recordset pagination may have semantic differences.
-- Parameter types and nullability require careful tests.
-- Existing applications may rely on nonstandard provider behavior.
+- `run` decides rows-vs-affected BEFORE executing (statement shape
+  analysis per driver: SQLite by prepared-column count, Postgres by
+  keyword prefix) so a statement never runs twice — an early draft
+  caught by the probe pattern executed an `INSERT` twice before that
+  rule existed.
+- A `Recordset` is a materialised snapshot with a cursor
+  (`position` between -1 = BOF and `len` = EOF); empty sets are both
+  BOF and EOF, and reading a `Field.Value` at BOF/EOF raises ADO's
+  "Either BOF or EOF is True" error text.
+- SQLite data-file paths confine to the app root like
+  FileSystemObject paths (component-based checks: the leaf file may
+  not exist yet, since SQLite creates it; traversal and escapes reject
+  without touching the filesystem). A data file landing outside the
+  root — found while probing — is the security regression this rule
+  prevents.
+
+Compatibility considerations (open):
+
+- ADO connection strings are often provider-specific; only the
+  SQLOLEDB/ODBC-Postgres/SQLite/postgres-URL shapes parse.
+- Cursor types, lock types, and recordset pagination do not exist
+  here yet (forward-only snapshot only).
+- Parameter types and nullability: values map dynamically (Empty/Null
+  -> SQL NULL); typed `CreateParameter` arguments validate against the
+  known ADO ranges but do not shape storage.
+- Existing applications may rely on nonstandard provider behavior
+  (documented unsupported list above).
 
 Acceptance criteria:
 
-- A sample ASP page can query a configured database.
-- Connection failures and SQL errors are surfaced as ASP errors.
-- Credentials come from environment or configuration, never hardcoded examples.
+- A sample ASP page can query a configured database. **Met** — the
+  guestbook golden renders from SQLite through the HTTP path.
+- Connection failures and SQL errors are surfaced as ASP errors. **Met** —
+  engine tests assert the runtime-error rendering for connect failures,
+  SQL errors, and closed-object use.
+- Credentials come from environment or configuration, never hardcoded
+  examples. **Met** — the Compose example reads the connection from
+  the environment with an `.env.example` template.
 
 ---
 
@@ -946,18 +999,31 @@ Definition of done:
 
 ### Milestone 6 — Database support
 
-**Status:** Not started
+**Status:** Built
 
 Deliverables:
 
-- Minimal ADO-compatible interfaces.
-- SQLite adapter and example.
-- PostgreSQL or MySQL adapter.
-- Parameterized queries and error handling.
+- Minimal ADO-compatible interfaces. **Built** — `ADODB.Connection`,
+  `ADODB.Command` (+ `Parameters`/`Parameter`), `ADODB.Recordset`
+  (+ `Fields`/`Field`) behind `Server.CreateObject`; the engine is
+  database-blind via the `AdoHost` trait, implemented by the runtime
+  with the `asp-db` adapters.
+- SQLite adapter and example. **Built** — bundled rusqlite in the
+  `asp-db` crate; `examples/hello-app/guestbook.asp` (golden test).
+- PostgreSQL adapter. **Built but not integration-tested** — the
+  `postgres` adapter compiles and implements the same trait
+  (transactions map nested `BeginTrans` to SAVEPOINTs); it needs a live
+  server to test, which the Docker Compose example wires for manual
+  runs, and CI does not run a database.
+- Parameterized queries and error handling. **Built** — positional `?`
+  parameters via `CreateParameter`/`Parameters.Append`/`Value` with
+  live binding at execute time; SQL errors surface as ASP runtime
+  errors; an open-failure aborts the page; SQLite paths are confined
+  to the app root like FileSystemObject access.
 
 Definition of done:
 
-- A database-backed ASP example runs in Docker Compose without hardcoded credentials.
+- A database-backed ASP example runs in Docker Compose without hardcoded credentials. **Met** — `examples/database/docker-compose.yml` reads the connection string from the environment (`.env.example` template, no credentials in the repo); the same page golden-tests against bundled SQLite locally.
 
 ### Milestone 7 — Real-application compatibility
 
@@ -1046,7 +1112,7 @@ This checklist applies before every pull request is marked ready for review.
 
 ## 12. Immediate next steps
 
-1. Milestone 6 — database support: minimal ADO-compatible interface, SQLite adapter first (`ADODB.Connection`/`Recordset` mapping; the ProgID registry from M5 makes this an additive change).
+1. Milestone 6 — database support: DONE (this milestone merged). Follow-ups when real apps need them: Postgres integration tests in CI (service container), `Recordset.Open` for source-compatibility, MySQL adapter, stored procedures/output parameters
 2. Session hardening follow-ups (small, do with M6 or as a standalone PR): signed session cookie values (HMAC with a per-process key), concurrent request handling so `Application.Lock` becomes real exclusion, and firing `Session_OnEnd`/`Application_OnEnd` from the expiry/abort paths.
 3. FSO completeness follow-up (as real apps need it): the `Folder`/`File`/`TextStream` object model with `ForReading`/`ForWriting`/`ForAppending` modes, plus `.Drive`-free path helpers.
 4. Finish the variant-semantics workstream: multi-dimensional arrays, `Byte`/binary data (`Request.BinaryRead`/`Response.BinaryWrite`), and a documented coercion table.

@@ -10,17 +10,19 @@ use crate::parser::Variant;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// The two ProgIDs RASP can create in Milestone 5.
+/// The two ProgIDs RASP could create before M6 (kept for the registry
+/// error message; ADO ProgIDs are appended at runtime).
 pub const REGISTRY: [&str; 2] = ["Scripting.FileSystemObject", "Scripting.Dictionary"];
 
 /// State of one live native object.
-#[derive(Debug, PartialEq)]
 pub enum NativeState {
     /// `Scripting.FileSystemObject`: operations all go through the host.
     FileSystem,
     /// `Scripting.Dictionary`: insertion-ordered key/value pairs with
     /// case-sensitive Variant keys (VBScript binary-compare mode).
     Dictionary(Vec<(Variant, Variant)>),
+    /// An ADO object (`ADODB.*`, M6): state lives in the shared cell.
+    Ado(super::ado::SharedAdo),
 }
 
 impl NativeState {
@@ -29,8 +31,19 @@ impl NativeState {
         match self {
             NativeState::FileSystem => "Scripting.FileSystemObject",
             NativeState::Dictionary(_) => "Scripting.Dictionary",
+            NativeState::Ado(cell) => {
+                let state = cell.borrow();
+                state.progid()
+            }
         }
     }
+}
+
+/// The full ProgID list RASP can create (M5 objects + ADO, M6).
+pub fn registry_all() -> Vec<&'static str> {
+    let mut all: Vec<&'static str> = REGISTRY.to_vec();
+    all.extend(super::ado::ADO_REGISTRY);
+    all
 }
 
 /// One live native object. `Clone` shares the same object (reference
@@ -61,18 +74,27 @@ impl std::fmt::Debug for NativeObj {
             NativeState::Dictionary(pairs) => {
                 write!(f, "NativeObj(Dictionary, {} items)", pairs.len())
             }
+            NativeState::Ado(cell) => {
+                let ado = cell.borrow();
+                write!(f, "NativeObj({})", ado.display_name())
+            }
         }
     }
 }
 
-/// Create a native object for a ProgID, or explain what is available.
+/// Create a native object for a ProgID (`Scripting.*` locally, `ADODB.*`
+/// through the ADO factory), or explain what is available.
 pub fn create_native(progid: &str) -> Result<Rc<NativeObj>, String> {
     match progid {
         "Scripting.FileSystemObject" => Ok(NativeObj::new(NativeState::FileSystem).share()),
         "Scripting.Dictionary" => Ok(NativeObj::new(NativeState::Dictionary(Vec::new())).share()),
+        ado if super::ado::ADO_REGISTRY.contains(&ado) => {
+            let state = super::ado::create_ado(ado)?;
+            Ok(NativeObj::new(NativeState::Ado(Rc::new(RefCell::new(state)))).share())
+        }
         other => Err(format!(
             "CreateObject: ProgID '{other}' is not available (supported: {})",
-            REGISTRY.join(", ")
+            registry_all().join(", ")
         )),
     }
 }

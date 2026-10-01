@@ -1,0 +1,26 @@
+# Docker Compose example: the guestbook ASP page against a real
+# database. Credentials come from the environment (see .env.example);
+# nothing in this file is hardcoded.
+
+services:
+  rasp:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      # The guestbook page reads RASP_DB_CONNECTION at startup.
+      - RASP_DB_CONNECTION=${RASP_DB_CONNECTION}
+      - ASP_DB_USER=${ASP_DB_USER}
+      - ASP_DB_PASSWORD=${ASP_DB_PASSWORD}
+    volumes:
+      # The ASP app (pages) is mounted read-only.
+      - ../hello-app:/app:ro
+      # The SQLite data folder is writable by the non-root process.
+      - rasp-data:/app/data
+    working_dir: /app
+    command: ["serve", "--root", "/app", "--port", "8080", "--default-document", "guestbook.asp"]
+
+volumes:
+  rasp-data:
