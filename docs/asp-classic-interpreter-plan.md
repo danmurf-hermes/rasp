@@ -204,7 +204,7 @@ Any status change should be accompanied by a short note in the relevant section 
 | Variant/value semantics | Partial | `Empty`/`Null`/`Bool`/`Int`/`Float`/`Str`/`Date`/`Array` with documented coercion rules (strings parse as dates before numbers); multi-dimensional arrays and `Byte`/binary data still to come. |
 | ASP intrinsic objects | In progress | `Response.Write/End/Clear` and the buffer passthrough work; `Request.QueryString` reads query/form/cookie data; Response controls (Redirect, ContentType, cookies) parse but their effects land in M3. |
 | Request lifecycle | In progress | Output buffers per request and ends early on `Response.End`; errors produce diagnostic pages/500s; timeouts and size limits still to come. |
-| Session state | Built | `Session` named values + `Contents`, `SessionID`, `Timeout`, `Abandon`; `ASPSESSIONID` cookie maps to an in-process store with idle expiry (Timeout minutes, default 20). Signed cookie values and pluggable remote stores deferred. |
+| Session state | Built | `Session` named values + `Contents`, `SessionID`, `Timeout`, `Abandon`; `ASPSESSIONID` cookie maps to an in-process store with idle expiry (Timeout minutes, default 20). Cookie values are HMAC-signed (per-process key); `Session_OnEnd` fires on abandon and expiry with the dying session's values. Pluggable remote stores deferred. |
 | Application state | Built | `Application` named values + `Contents`, `Lock`/`UnLock`; per-process state. Lock is a flag until concurrent request handling exists. |
 | `global.asa` support | Built | `Application_OnStart` (once per process) and `Session_OnStart` (per new session) fire before the page; `Session_OnEnd`/`Application_OnEnd` are parsed but not fired (in-process sessions end with the process). |
 | Filesystem object mapping | Partial | `Server.CreateObject` + native registry; sandboxed `Scripting.FileSystemObject` (existence/reads/creates/deletes/listing, traversal and symlink tests) and `Scripting.Dictionary`; full TextStream/Folder object model still to come. |
@@ -507,12 +507,17 @@ Initial support:
 - Named values.
 - `Contents`.
 
-Built (M4): named values and `Contents` round-trip through the
-`ASPSESSIONID` cookie's in-process store, idle expiry uses each
+Built (M4, hardened): named values and `Contents` round-trip through
+the `ASPSESSIONID` cookie's in-process store, idle expiry uses each
 session's own `Timeout` (default 20 minutes), `SessionID` renders as
-hex, `Abandon` drops the session at request end. Deferred: signed
-cookie values (ids are store-issued but not HMAC'd), `StaticObjects`,
-and pluggable remote stores.
+hex, and `Abandon` drops the session at request end. Cookie values are
+HMAC-SHA256-signed under a per-process random key
+(`asp-core::cookie_sign`, constant-time verified): a forged cookie is
+treated as no session. `Session_OnEnd` fires when a session is
+abandoned or idles out — the handler sees the dying session's values
+and the shared `Application`, never `Request`/`Response`/`Server`
+(IIS behaviour). Deferred: `StaticObjects` and pluggable remote
+stores.
 
 Storage phases:
 
@@ -965,7 +970,9 @@ Deliverables:
   `Contents`, `SessionID`/`Timeout`/`Abandon`, `Lock`/`UnLock` (flag).
 - Basic `global.asa` event handling. **Built** — `Application_OnStart`
   and `Session_OnStart` fire (once per process / per new session);
-  `*OnEnd` handlers are parsed but not fired yet.
+  `Session_OnEnd` fires on abandon and idle expiry with the dying
+  session's values; `Application_OnEnd` stays parsed-but-not-fired
+  (IIS fires it on application recycle, a process-lifetime event).
 
 Definition of done:
 
@@ -1113,7 +1120,11 @@ This checklist applies before every pull request is marked ready for review.
 ## 12. Immediate next steps
 
 1. Milestone 6 — database support: DONE (this milestone merged). Follow-ups when real apps need them: Postgres integration tests in CI (service container), `Recordset.Open` for source-compatibility, MySQL adapter, stored procedures/output parameters
-2. Session hardening follow-ups (small, do with M6 or as a standalone PR): signed session cookie values (HMAC with a per-process key), concurrent request handling so `Application.Lock` becomes real exclusion, and firing `Session_OnEnd`/`Application_OnEnd` from the expiry/abort paths.
+2. Session hardening — DONE part 1 (signed HMAC cookie values with a
+   per-process key, `Session_OnEnd` firing on abandon and idle expiry
+   including resolve-time parked drops). Remaining: concurrent request
+   handling so `Application.Lock` becomes real exclusion, and
+   `Application_OnEnd` when application lifecycle work lands.
 3. FSO completeness follow-up (as real apps need it): the `Folder`/`File`/`TextStream` object model with `ForReading`/`ForWriting`/`ForAppending` modes, plus `.Drive`-free path helpers.
 4. Finish the variant-semantics workstream: multi-dimensional arrays, `Byte`/binary data (`Request.BinaryRead`/`Response.BinaryWrite`), and a documented coercion table.
 5. Keep `AGENTS.md` in step with new conventions as they emerge (note: the M2 executor's normalization pass over deferred delimiters is the load-bearing architecture for cross-block and nested constructs).

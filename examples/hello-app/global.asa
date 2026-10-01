@@ -12,6 +12,8 @@ End Sub
 
 <SCRIPT RUNAT=Server LANGUAGE="VBScript">
 Sub Session_OnEnd
-  ' In-process sessions end with the process; nothing to clean up yet.
+  ' Fired when the session is abandoned or idles out; the dying
+  ' session's values are readable here (IIS behaviour).
+  Application("last_ended_views") = Session("page_views")
 End Sub
 </SCRIPT>

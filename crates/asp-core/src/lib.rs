@@ -1,5 +1,6 @@
 //! Shared AST, values, errors, page model, and include model for RASP.
 
+pub mod cookie_sign;
 pub mod db;
 pub mod error;
 pub mod fs;
